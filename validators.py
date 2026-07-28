@@ -102,7 +102,10 @@ def coerce_number(value: object) -> float | None:
 
 def validate_dataframe(df: pd.DataFrame, report: ValidationReport) -> ValidationReport:
     report.add_check("Main table rows found?", not df.empty)
-    report.add_check("Row count reasonable?", 1 <= len(df) <= 35)
+    row_count_ok = 1 <= len(df) <= 35
+    report.add_check("Row count reasonable?", row_count_ok)
+    if not row_count_ok:
+        report.add_error(f"Row count outside the expected range (1-35): {len(df)}")
     report.import_rows = len(df)
 
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
@@ -149,5 +152,4 @@ def mark_duplicate_counts(existing_keys: Iterable[tuple[str, str, str]], df: pd.
     incoming_keys = list(zip(df["date"].astype(str), df["project_no"], df["dimensions"]))
     report.update_rows = sum(1 for key in incoming_keys if key in existing)
     report.insert_rows = len(incoming_keys) - report.update_rows
-    report.add_check("Duplicate check performed?", True)
     return report

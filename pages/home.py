@@ -33,6 +33,7 @@ from calculations import (
     repair_amount_trend_data,
 )
 from database import (
+    get_existing_keys,
     load_historical_baselines,
     load_master_data,
     load_pipe_repair_details,
@@ -46,6 +47,7 @@ from parser import parse_daily_repair_rate
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
 from project_parser import parse_project_pipe_repairs
+from validators import mark_duplicate_counts
 
 dash.register_page(__name__, path="/", name="Dashboard")
 
@@ -453,7 +455,12 @@ def _validation_summary(report) -> html.Div:
         children.append(html.H4(f"Errors ({len(report.errors)})", className="error-heading"))
         children.append(html.Ul(error_rows, className="error-list"))
     else:
-        children.append(html.P(f"{report.import_rows} rows read, no errors.", className="success-text"))
+        summary_text = f"{report.import_rows} rows read, no errors."
+        if report.insert_rows or report.update_rows:
+            summary_text += (
+                f" ({report.insert_rows} new, {report.update_rows} will update existing records for this date.)"
+            )
+        children.append(html.P(summary_text, className="success-text"))
 
     return html.Div(children, className="validation-box ok" if report.ok else "validation-box fail")
 
@@ -505,6 +512,15 @@ def handle_upload(contents, filename):
             className="validation-box fail",
         )
         return error_box, None, None, {"display": "none"}, None, None
+
+    if not df.empty and report.ok:
+        # Tell the user upfront whether this import will overwrite existing
+        # rows for this date, rather than silently upserting on confirm.
+        try:
+            existing_keys = get_existing_keys(df)
+            report = mark_duplicate_counts(existing_keys, df, report)
+        except Exception:
+            pass  # best-effort; missing counts just won't be shown
 
     validation_box = _validation_summary(report)
 
