@@ -34,6 +34,7 @@ from database import (
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate
+from pdf_report import build_pdf_report
 from project_parser import parse_project_pipe_repairs
 
 dash.register_page(__name__, path="/", name="Dashboard")
@@ -113,10 +114,21 @@ def layout():
                     html.Div(
                         [
                             html.H2("3) Dashboard"),
-                            html.Button("Refresh Data", id="refresh-dashboard-btn", className="secondary-btn"),
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "Download PDF Report",
+                                        id="download-pdf-report-btn",
+                                        className="secondary-btn",
+                                    ),
+                                    html.Button("Refresh Data", id="refresh-dashboard-btn", className="secondary-btn"),
+                                ],
+                                className="button-group",
+                            ),
                         ],
                         className="section-header-row",
                     ),
+                    dcc.Download(id="pdf-report-download"),
                     dcc.Loading(html.Div(id="dashboard-content")),
                 ],
                 className="card",
@@ -360,7 +372,34 @@ def confirm_baseline_import(n_clicks, stored_json):
 
 
 # ---------------------------------------------------------------------------
-# Callback 6: Load / refresh the dashboard
+# Callback 6: Download the A3 PDF report for the latest report date
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("pdf-report-download", "data"),
+    Input("download-pdf-report-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def download_pdf_report(n_clicks):
+    if not n_clicks:
+        return dash.no_update
+
+    master_df = load_master_data()
+    if master_df.empty:
+        return dash.no_update
+
+    baseline_df = load_historical_baselines()
+    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
+
+    latest_date = master_df["date"].max()
+    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date)
+    filename = f"repair_rate_report_{latest_date.date().isoformat()}.pdf"
+
+    return dcc.send_bytes(pdf_bytes, filename)
+
+
+# ---------------------------------------------------------------------------
+# Callback 7: Load / refresh the dashboard
 # ---------------------------------------------------------------------------
 
 @callback(
