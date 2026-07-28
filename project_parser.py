@@ -35,7 +35,10 @@ NON_PROJECT_SHEETS = {
 }
 
 _LABEL_PREFIX = "repairrate"
-_LENGTH_RE = re.compile(r"(\d+)'\s*(\d+)?")
+# Two label formats seen across sheets: "129' 8\" ft" (feet+inches) and
+# "134.54 FT" / "134.54 ft" (decimal feet).
+_LENGTH_FT_IN_RE = re.compile(r"(\d+)\s*'\s*(\d+)?\s*\"")
+_LENGTH_DECIMAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ft\b", re.IGNORECASE)
 
 PIPE_NO_ROW_OFFSET = 4
 DATA_ROW_OFFSET = 5
@@ -56,17 +59,28 @@ def _is_label_cell(value: object) -> bool:
 
 
 def _parse_length_ft(value: object) -> float | None:
-    """Parse a "129' 8\" ft" style label into a decimal feet value."""
+    """Parse a pipe-length label into a decimal feet value.
+
+    Handles both "129' 8\" ft" (feet+inches) and "134.54 FT" (decimal feet)
+    label formats — different project sheets use different templates.
+    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    match = _LENGTH_RE.search(str(value))
-    if not match:
-        return None
-    feet = int(match.group(1))
-    inches = int(match.group(2)) if match.group(2) else 0
-    return round(feet + inches / 12, 4)
+
+    text = str(value).strip()
+    match = _LENGTH_FT_IN_RE.search(text)
+    if match:
+        feet = int(match.group(1))
+        inches = int(match.group(2)) if match.group(2) else 0
+        return round(feet + inches / 12, 4)
+
+    match = _LENGTH_DECIMAL_RE.search(text)
+    if match:
+        return round(float(match.group(1)), 4)
+
+    return None
 
 
 def _load_sheet_grid(ws) -> dict[tuple[int, int], object]:

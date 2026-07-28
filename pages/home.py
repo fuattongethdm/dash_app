@@ -73,14 +73,29 @@ COLUMN_LABELS = {
     "pipe_no": "Pipe No.",
     "pipe_length_ft": "Pipe Length (ft)",
     "repair_amount": "Repair Amount (m)",
-    "repair_count": "Repair Count",
+    "repair_count": "B.E Count",
     "repair_category": "Category",
     "surface_state": "Surface State",
 }
 
+# Ratio columns are displayed as percentages instead of raw decimals.
+PERCENT_COLUMNS = {"repair_ratio", "repair_ratio_incl_skelp", "avg_repair_ratio", "max_repair_ratio"}
+
 
 def _table_columns(columns) -> list[dict]:
     return [{"name": COLUMN_LABELS.get(c, c.replace("_", " ").title()), "id": c} for c in columns]
+
+
+def _table_records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
+    """Format a DataFrame for display: ratio columns as percentages (2
+    decimals), other numeric columns rounded to 2 decimals."""
+    out = df[columns].copy()
+    for col in columns:
+        if col in PERCENT_COLUMNS:
+            out[col] = out[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].round(2)
+    return out.to_dict("records")
 
 
 # ---------------------------------------------------------------------------
@@ -389,9 +404,10 @@ def handle_upload(contents, filename):
     if df.empty or not report.ok:
         return validation_box, None, None, {"display": "none"}, None, None
 
+    preview_columns = [c for c in df.columns if c != "excel_row"]
     preview = dash_table.DataTable(
-        data=df.drop(columns=["excel_row"], errors="ignore").to_dict("records"),
-        columns=_table_columns([c for c in df.columns if c != "excel_row"]),
+        data=_table_records(df, preview_columns),
+        columns=_table_columns(preview_columns),
         page_size=15,
         style_table={"overflowX": "auto"},
         style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
@@ -509,7 +525,7 @@ def handle_baseline_upload(contents, filename):
         return validation_box, None, {"display": "none"}, None
 
     preview = dash_table.DataTable(
-        data=df.to_dict("records"),
+        data=_table_records(df, list(df.columns)),
         columns=_table_columns(df.columns),
         page_size=15,
         style_table={"overflowX": "auto"},
@@ -632,6 +648,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
     )
+    trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
     # --- Daily repair amount (bar) ---
     daily_amount = repair_amount_trend_data(master_df, display_unit="m")
@@ -643,6 +660,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         title="Daily Repair Amount",
     )
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    bar_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
     # --- Worst-performing projects (latest day) ---
     worst = latest_df.sort_values("repair_ratio", ascending=False).head(10)
@@ -660,6 +678,79 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         margin=dict(l=120, r=20, t=50, b=40),
     )
 
+    # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
+    skelp_df = latest_df[["project_no", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
+    skelp_df["skelp_impact"] = skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]
+    skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
+    skelp_fig = go.Figure()
+    skelp_fig.add_trace(
+        go.Bar(x=skelp_top["project_no"], y=skelp_top["repair_ratio"], name="Repair Ratio", marker_color="#2563eb")
+    )
+    skelp_fig.add_trace(
+        go.Bar(x=skelp_top["project_no"], y=skelp_top["skelp_impact"], name="Skelp Impact", marker_color="#f97316")
+    )
+    skelp_fig.update_layout(
+        barmode="stack",
+        title="Skelp Impact on Repair Ratio (Top 10, Latest Day)",
+        yaxis_title="Repair Ratio",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=80),
+    )
+    skelp_fig.update_xaxes(tickangle=-45)
+
+    # --- Repair amount by dimension ---
+    dimension_df = (
+        latest_df.groupby("dimensions", as_index=False)
+        .agg(total_repair_amount=("total_repair_amount", "sum"), project_count=("project_no", "nunique"))
+        .sort_values("total_repair_amount", ascending=False)
+        .head(15)
+    )
+    dimension_fig = px.bar(
+        dimension_df,
+        x="dimensions",
+        y="total_repair_amount",
+        labels={"dimensions": "Dimensions", "total_repair_amount": "Total Repair Amount (m)"},
+        title="Repair Amount by Dimension (Latest Day)",
+    )
+    dimension_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    dimension_fig.update_xaxes(tickangle=-45)
+
+    # --- Repair amount pareto: which projects drive most of the total ---
+    pareto_df = latest_df[["project_no", "total_repair_amount"]].sort_values(
+        "total_repair_amount", ascending=False
+    ).reset_index(drop=True)
+    pareto_df["cumulative_pct"] = (
+        pareto_df["total_repair_amount"].cumsum() / pareto_df["total_repair_amount"].sum() * 100
+    )
+    pareto_fig = go.Figure()
+    pareto_fig.add_trace(
+        go.Bar(
+            x=pareto_df["project_no"],
+            y=pareto_df["total_repair_amount"],
+            name="Repair Amount (m)",
+            marker_color="#2563eb",
+        )
+    )
+    pareto_fig.add_trace(
+        go.Scatter(
+            x=pareto_df["project_no"],
+            y=pareto_df["cumulative_pct"],
+            name="Cumulative %",
+            yaxis="y2",
+            line=dict(color="#f97316", width=2),
+            mode="lines+markers",
+        )
+    )
+    pareto_fig.update_layout(
+        title="Repair Amount Pareto (Latest Day)",
+        template="plotly_white",
+        yaxis=dict(title="Repair Amount (m)"),
+        yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
+        margin=dict(l=40, r=40, t=50, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    pareto_fig.update_xaxes(tickangle=-45)
+
     # --- Latest day detail table ---
     table_columns = [
         "project_no",
@@ -670,7 +761,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         "repair_ratio",
     ]
     detail_table = dash_table.DataTable(
-        data=latest_df[table_columns].round(4).to_dict("records"),
+        data=_table_records(latest_df, table_columns),
         columns=_table_columns(table_columns),
         page_size=15,
         sort_action="native",
@@ -690,6 +781,14 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 className="chart-row",
             ),
             dcc.Graph(figure=worst_fig),
+            html.Div(
+                [
+                    dcc.Graph(figure=skelp_fig, className="chart-half"),
+                    dcc.Graph(figure=dimension_fig, className="chart-half"),
+                ],
+                className="chart-row",
+            ),
+            dcc.Graph(figure=pareto_fig),
             html.H3("Latest Day — Project Details"),
             detail_table,
         ]
@@ -760,12 +859,13 @@ def render_pipe_analysis(selected_date, selected_sheet):
     day_df = df[df["date"].dt.date.astype(str) == selected_date]
 
     summary_table = summarize_pipe_totals_by_sheet(day_df)
+    summary_columns = list(summary_table.columns)
     summary_section = html.Div(
         [
             html.H3("All Project Sheets — Summary"),
             dash_table.DataTable(
-                data=summary_table.round(4).to_dict("records"),
-                columns=_table_columns(summary_table.columns),
+                data=_table_records(summary_table, summary_columns),
+                columns=_table_columns(summary_columns),
                 page_size=10,
                 sort_action="native",
                 style_table={"overflowX": "auto"},
@@ -789,9 +889,9 @@ def render_pipe_analysis(selected_date, selected_sheet):
     worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
     worst_fig.update_xaxes(type="category")
 
-    detail_columns = [c for c in sheet_df.columns if c != "date"]
+    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state")]
     detail_table = dash_table.DataTable(
-        data=sheet_df[detail_columns].round(4).to_dict("records"),
+        data=_table_records(sheet_df, detail_columns),
         columns=_table_columns(detail_columns),
         page_size=20,
         sort_action="native",
