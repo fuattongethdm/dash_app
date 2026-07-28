@@ -202,3 +202,23 @@ body {
   flex: 1;
   min-width: 320px;
 }
+
+.filter-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.filter-field {
+  flex: 1;
+  min-width: 220px;
+}
+
+.filter-field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  margin-bottom: 4px;
+}

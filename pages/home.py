@@ -30,9 +30,11 @@ from database import (
     load_historical_baselines,
     load_master_data,
     upsert_historical_baselines,
+    upsert_pipe_repair_details,
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate
+from project_parser import parse_project_pipe_repairs
 
 dash.register_page(__name__, path="/", name="Dashboard")
 
@@ -46,6 +48,7 @@ def layout():
         [
             # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
+            dcc.Store(id="parsed-pipe-data-store"),
             html.Section(
                 [
                     html.H2("1) Upload Daily Excel"),
@@ -59,6 +62,7 @@ def layout():
                     ),
                     html.Div(id="upload-validation-result"),
                     html.Div(id="upload-preview-table"),
+                    html.Div(id="pipe-parse-summary"),
                     html.Button(
                         "Confirm Import",
                         id="confirm-import-btn",
@@ -170,15 +174,17 @@ def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
 @callback(
     Output("upload-validation-result", "children"),
     Output("upload-preview-table", "children"),
+    Output("pipe-parse-summary", "children"),
     Output("confirm-import-btn", "style"),
     Output("parsed-data-store", "data"),
+    Output("parsed-pipe-data-store", "data"),
     Input("excel-upload", "contents"),
     State("excel-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if contents is None:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     try:
         file_obj = _decode_upload(contents)
@@ -188,12 +194,12 @@ def handle_upload(contents, filename):
             f"An unexpected error occurred while reading the file: {exc}",
             className="validation-box fail",
         )
-        return error_box, None, {"display": "none"}, None
+        return error_box, None, None, {"display": "none"}, None, None
 
     validation_box = _validation_summary(report)
 
     if df.empty or not report.ok:
-        return validation_box, None, {"display": "none"}, None
+        return validation_box, None, None, {"display": "none"}, None, None
 
     preview = dash_table.DataTable(
         data=df.drop(columns=["excel_row"], errors="ignore").to_dict("records"),
@@ -203,11 +209,31 @@ def handle_upload(contents, filename):
         style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
     )
 
+    pipe_summary = None
+    pipe_data_json = None
+    try:
+        pipe_file_obj = _decode_upload(contents)
+        pipe_df, pipe_report = parse_project_pipe_repairs(pipe_file_obj, df["date"].iloc[0])
+        if not pipe_df.empty:
+            pipe_summary = html.P(
+                f"Pipe-level: {pipe_report.parsed_rows} rows parsed from "
+                f"{pipe_report.parsed_sheets} project sheets.",
+                className="help-text",
+            )
+            pipe_data_json = pipe_df.to_json(date_format="iso", orient="split")
+    except Exception as exc:  # pipe-level parsing is best-effort, never blocks the main import
+        pipe_summary = html.P(
+            f"Pipe-level parsing failed (main import is unaffected): {exc}",
+            className="help-text",
+        )
+
     return (
         validation_box,
         html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
+        pipe_summary,
         {"display": "inline-block"},
         df.to_json(date_format="iso", orient="split"),
+        pipe_data_json,
     )
 
 
@@ -218,18 +244,31 @@ def handle_upload(contents, filename):
 @callback(
     Output("import-confirm-result", "children"),
     Output("parsed-data-store", "data", allow_duplicate=True),
+    Output("parsed-pipe-data-store", "data", allow_duplicate=True),
     Input("confirm-import-btn", "n_clicks"),
     State("parsed-data-store", "data"),
+    State("parsed-pipe-data-store", "data"),
     prevent_initial_call=True,
 )
-def confirm_import(n_clicks, stored_json):
+def confirm_import(n_clicks, stored_json, stored_pipe_json):
     if not n_clicks or not stored_json:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     df = pd.read_json(io.StringIO(stored_json), orient="split")
     written = upsert_repair_rates(df)
+
+    pipe_written = 0
+    if stored_pipe_json:
+        pipe_df = pd.read_json(io.StringIO(stored_pipe_json), orient="split")
+        pipe_written = upsert_pipe_repair_details(pipe_df)
+
+    message = f"✅ {written} rows saved to the database."
+    if pipe_written:
+        message += f" ({pipe_written} pipe-level rows saved.)"
+
     return (
-        html.Div(f"✅ {written} rows saved to the database.", className="success-text"),
+        html.Div(message, className="success-text"),
+        None,
         None,
     )
 

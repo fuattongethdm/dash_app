@@ -8,3 +8,4 @@ data/
 *.sqlite
 *.db
 *.xlsx
+.DS_Store
