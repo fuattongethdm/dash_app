@@ -444,25 +444,27 @@ def _decode_upload(contents: str) -> io.BytesIO:
 
 
 def _validation_summary(report) -> html.Div:
-    check_rows = [
-        html.Li(f"{'✅' if ok else '❌'} {name}", className="check-ok" if ok else "check-fail")
-        for name, ok in report.checks.items()
-    ]
-    error_rows = [html.Li(err) for err in report.errors]
+    if not report.ok:
+        # Only show the full checklist when something actually failed, so
+        # the user can see which check tripped and why.
+        check_rows = [
+            html.Li(f"{'✅' if ok else '❌'} {name}", className="check-ok" if ok else "check-fail")
+            for name, ok in report.checks.items()
+        ]
+        error_rows = [html.Li(err) for err in report.errors]
+        children = [
+            html.Ul(check_rows),
+            html.H4(f"Errors ({len(report.errors)})", className="error-heading"),
+            html.Ul(error_rows, className="error-list"),
+        ]
+        return html.Div(children, className="validation-box fail")
 
-    children = [html.Ul(check_rows)]
-    if report.errors:
-        children.append(html.H4(f"Errors ({len(report.errors)})", className="error-heading"))
-        children.append(html.Ul(error_rows, className="error-list"))
-    else:
-        summary_text = f"{report.import_rows} rows read, no errors."
-        if report.insert_rows or report.update_rows:
-            summary_text += (
-                f" ({report.insert_rows} new, {report.update_rows} will update existing records for this date.)"
-            )
-        children.append(html.P(summary_text, className="success-text"))
-
-    return html.Div(children, className="validation-box ok" if report.ok else "validation-box fail")
+    summary_text = f"✅ {report.import_rows} rows read, no errors."
+    if report.insert_rows or report.update_rows:
+        summary_text += (
+            f" ({report.insert_rows} new, {report.update_rows} will update existing records for this date.)"
+        )
+    return html.Div(html.P(summary_text, className="success-text"), className="validation-box ok")
 
 
 def _empty_state(message: str) -> html.Div:
