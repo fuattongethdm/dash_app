@@ -252,6 +252,29 @@ def layout():
                                 ],
                                 className="card",
                             ),
+                            html.Section(
+                                [
+                                    html.H2("Dimension Detail"),
+                                    html.P(
+                                        "Select a dimension to compare all projects sharing it (latest day).",
+                                        className="help-text",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [
+                                                    html.Label("Dimension"),
+                                                    dcc.Dropdown(id="dimension-detail-dropdown"),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    dcc.Loading(html.Div(id="dimension-detail-content")),
+                                ],
+                                className="card",
+                            ),
                         ],
                     ),
                     dcc.Tab(
@@ -723,7 +746,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     # --- Repair amount by dimension ---
     dimension_df = (
         latest_df.groupby("dimensions", as_index=False)
-        .agg(total_repair_amount=("total_repair_amount", "sum"), project_count=("project_no", "nunique"))
+        .agg(
+            total_repair_amount=("total_repair_amount", "sum"),
+            repaired_spiral_length=("repaired_spiral_length", "sum"),
+            project_count=("project_no", "nunique"),
+        )
         .sort_values("total_repair_amount", ascending=False)
         .head(15)
     )
@@ -736,6 +763,22 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     dimension_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
     dimension_fig.update_xaxes(tickangle=-45)
+
+    # --- Weighted repair ratio by dimension ---
+    dimension_ratio_df = dimension_df.copy()
+    denom = dimension_ratio_df["repaired_spiral_length"] * METERS_PER_FOOT
+    dimension_ratio_df["weighted_ratio"] = (dimension_ratio_df["total_repair_amount"] / denom.where(denom != 0)).fillna(0)
+    dimension_ratio_df = dimension_ratio_df.sort_values("weighted_ratio", ascending=False)
+    dimension_ratio_fig = px.bar(
+        dimension_ratio_df,
+        x="dimensions",
+        y="weighted_ratio",
+        labels={"dimensions": "Dimensions", "weighted_ratio": "Weighted Repair Ratio"},
+        title="Weighted Repair Ratio by Dimension (Latest Day)",
+    )
+    dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    dimension_ratio_fig.update_xaxes(tickangle=-45)
+    dimension_ratio_fig.update_yaxes(tickformat=".1%")
 
     # --- Repair amount pareto: which projects drive most of the total ---
     pareto_df = latest_df[["project_no", "total_repair_amount"]].sort_values(
@@ -891,6 +934,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 ],
                 className="chart-row",
             ),
+            dcc.Graph(figure=dimension_ratio_fig),
             dcc.Graph(figure=pareto_fig),
             dcc.Graph(figure=type_trend_fig),
             html.Div(
@@ -1061,7 +1105,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
     worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
     worst_fig.update_xaxes(type="category")
 
-    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state")]
+    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state", "repair_category")]
     detail_table = dash_table.DataTable(
         data=_table_records(sheet_df, detail_columns),
         columns=_table_columns(detail_columns),
@@ -1137,3 +1181,71 @@ def save_groups(n_clicks, selected_sheet, pipe_groups, machine_groups):
         return dash.no_update
     upsert_project_group_config(selected_sheet, selected_sheet, "", pipe_groups or "", machine_groups or "")
     return html.Div(f"✅ Groups saved for {selected_sheet}.", className="success-text")
+
+
+# ---------------------------------------------------------------------------
+# Callback 14: Dimension Detail — populate the dimension dropdown
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("dimension-detail-dropdown", "options"),
+    Output("dimension-detail-dropdown", "value"),
+    Input("dimension-detail-dropdown", "id"),  # fires once, on page load
+    Input("import-confirm-result", "children"),  # refresh after a new import
+)
+def load_dimension_options(_id, _import_result):
+    master_df = load_master_data()
+    if master_df.empty:
+        return [], None
+    latest_date = master_df["date"].max()
+    latest_df = master_df[master_df["date"] == latest_date]
+    dims = sorted(latest_df["dimensions"].dropna().unique())
+    options = [{"label": d, "value": d} for d in dims]
+    return options, options[0]["value"] if options else None
+
+
+# ---------------------------------------------------------------------------
+# Callback 15: Dimension Detail — compare projects sharing the selected dimension
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("dimension-detail-content", "children"),
+    Input("dimension-detail-dropdown", "value"),
+)
+def render_dimension_detail(selected_dimension):
+    if not selected_dimension:
+        return html.P("No data available. Import an Excel file first.")
+
+    master_df = load_master_data()
+    latest_date = master_df["date"].max()
+    latest_df = master_df[master_df["date"] == latest_date].copy()
+    latest_df = apply_meter_based_repair_ratios(latest_df)
+
+    dim_df = latest_df[latest_df["dimensions"] == selected_dimension].sort_values(
+        "repair_ratio", ascending=False
+    )
+    if dim_df.empty:
+        return html.P("No projects found for this dimension on the latest day.")
+
+    fig = px.bar(
+        dim_df,
+        x="project_no",
+        y="repair_ratio",
+        labels={"project_no": "Project", "repair_ratio": "Repair Ratio"},
+        title=f"Projects with Dimension {selected_dimension} (Latest Day)",
+    )
+    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    fig.update_xaxes(tickangle=-45)
+    fig.update_yaxes(tickformat=".1%")
+
+    table_columns = ["project_no", "production_type", "qty", "project_status", "repair_ratio"]
+    table = dash_table.DataTable(
+        data=_table_records(dim_df, table_columns),
+        columns=_table_columns(table_columns),
+        page_size=10,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+    )
+
+    return html.Div([dcc.Graph(figure=fig), table])
