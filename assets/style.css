@@ -227,3 +227,14 @@ body {
   color: var(--color-text-muted);
   margin-bottom: 4px;
 }
+
+.group-textarea {
+  width: 100%;
+  min-height: 70px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}

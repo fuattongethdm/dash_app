@@ -1,12 +1,15 @@
 """
-Module 1: Daily Repair Rate Dashboard.
+Dashboard page: daily Excel import, historical baseline import, the main
+dashboard, pipe-level drill-down, and project grouping — organized as tabs
+so the page doesn't grow into one long endless scroll as more sections
+are added.
 
 Flow:
   1) User uploads the Excel file (dcc.Upload)
   2) Read via parser.parse_daily_repair_rate(), validated with validators
   3) Validation result and preview are shown to the user
   4) Clicking "Confirm Import" writes the data to the database (upsert)
-  5) The dashboard below refreshes from ALL data currently in the database
+  5) The dashboard tab refreshes from ALL data currently in the database
 """
 
 from __future__ import annotations
@@ -30,8 +33,10 @@ from database import (
     load_historical_baselines,
     load_master_data,
     load_pipe_repair_details,
+    load_project_group_config,
     upsert_historical_baselines,
     upsert_pipe_repair_details,
+    upsert_project_group_config,
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate
@@ -43,8 +48,60 @@ dash.register_page(__name__, path="/", name="Dashboard")
 
 
 # ---------------------------------------------------------------------------
+# Display labels — table columns show these instead of raw field names
+# ---------------------------------------------------------------------------
+
+COLUMN_LABELS = {
+    "date": "Date",
+    "production_type": "Type",
+    "project_no": "Project",
+    "dimensions": "Dimensions",
+    "qty": "Qty",
+    "project_total_pipe_length": "Total Pipe Length (ft)",
+    "repaired_pipes_total_length": "Repaired Pipes Length (ft)",
+    "repaired_spiral_length": "Repaired Spiral Length (ft)",
+    "project_status": "Status",
+    "repair_ratio": "Repair Ratio",
+    "repair_ratio_incl_skelp": "Repair Ratio (incl. Skelp)",
+    "total_repair_amount": "Total Repair Amount (m)",
+    "total_repair_amount_incl_skelp": "Total Repair Amount (incl. Skelp, m)",
+    "project_sheet": "Project Sheet",
+    "pipe_count": "Pipe Count",
+    "avg_repair_ratio": "Avg Repair Ratio",
+    "max_repair_ratio": "Max Repair Ratio",
+    "block_cell": "Cell Ref.",
+    "pipe_no": "Pipe No.",
+    "pipe_length_ft": "Pipe Length (ft)",
+    "repair_amount": "Repair Amount (m)",
+    "repair_count": "Repair Count",
+    "repair_category": "Category",
+    "surface_state": "Surface State",
+}
+
+
+def _table_columns(columns) -> list[dict]:
+    return [{"name": COLUMN_LABELS.get(c, c.replace("_", " ").title()), "id": c} for c in columns]
+
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
+
+_TAB_STYLE = {
+    "padding": "12px 20px",
+    "fontWeight": "600",
+    "color": "#64748b",
+    "border": "none",
+    "borderBottom": "3px solid transparent",
+    "backgroundColor": "#f4f6f8",
+}
+_TAB_SELECTED_STYLE = {
+    **_TAB_STYLE,
+    "color": "#2563eb",
+    "borderBottom": "3px solid #2563eb",
+    "backgroundColor": "#ffffff",
+}
+
 
 def layout():
     return html.Div(
@@ -52,113 +109,205 @@ def layout():
             # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
             dcc.Store(id="parsed-pipe-data-store"),
-            html.Section(
-                [
-                    html.H2("1) Upload Daily Excel"),
-                    dcc.Upload(
-                        id="excel-upload",
-                        children=html.Div(
-                            ["Drag and drop the Excel file here or ", html.A("select a file")]
-                        ),
-                        className="upload-box",
-                        multiple=False,
-                    ),
-                    html.Div(id="upload-validation-result"),
-                    html.Div(id="upload-preview-table"),
-                    html.Div(id="pipe-parse-summary"),
-                    html.Button(
-                        "Confirm Import",
-                        id="confirm-import-btn",
-                        className="primary-btn",
-                        style={"display": "none"},
-                    ),
-                    html.Div(id="import-confirm-result"),
-                ],
-                className="card",
-            ),
-            html.Section(
-                [
-                    html.H2("2) Historical Baseline"),
-                    html.P(
-                        "Upload a CSV to include the total repair amount of projects "
-                        "carried over from previous years in the overall repair rate calculation.",
-                        className="help-text",
-                    ),
-                    html.Button(
-                        "Download Template CSV",
-                        id="download-baseline-template-btn",
-                        className="secondary-btn",
-                    ),
-                    dcc.Download(id="baseline-template-download"),
-                    dcc.Store(id="parsed-baseline-store"),
-                    dcc.Upload(
-                        id="baseline-upload",
-                        children=html.Div(
-                            ["Drag and drop the CSV file here or ", html.A("select a file")]
-                        ),
-                        className="upload-box",
-                        multiple=False,
-                    ),
-                    html.Div(id="baseline-validation-result"),
-                    html.Div(id="baseline-preview-table"),
-                    html.Button(
-                        "Confirm Baseline Import",
-                        id="confirm-baseline-import-btn",
-                        className="primary-btn",
-                        style={"display": "none"},
-                    ),
-                    html.Div(id="baseline-import-confirm-result"),
-                ],
-                className="card",
-            ),
-            html.Section(
-                [
-                    html.Div(
-                        [
-                            html.H2("3) Dashboard"),
-                            html.Div(
+            dcc.Tabs(
+                id="dashboard-tabs",
+                value="tab-dashboard",
+                style={"borderBottom": "1px solid #e2e8f0"},
+                children=[
+                    dcc.Tab(
+                        label="Import",
+                        value="tab-import",
+                        style=_TAB_STYLE,
+                        selected_style=_TAB_SELECTED_STYLE,
+                        children=[
+                            html.Section(
                                 [
+                                    html.H2("Upload Daily Excel"),
+                                    dcc.Upload(
+                                        id="excel-upload",
+                                        children=html.Div(
+                                            ["Drag and drop the Excel file here or ", html.A("select a file")]
+                                        ),
+                                        className="upload-box",
+                                        multiple=False,
+                                    ),
+                                    html.Div(id="upload-validation-result"),
+                                    html.Div(id="upload-preview-table"),
+                                    html.Div(id="pipe-parse-summary"),
                                     html.Button(
-                                        "Download PDF Report",
-                                        id="download-pdf-report-btn",
+                                        "Confirm Import",
+                                        id="confirm-import-btn",
+                                        className="primary-btn",
+                                        style={"display": "none"},
+                                    ),
+                                    html.Div(id="import-confirm-result"),
+                                ],
+                                className="card",
+                            ),
+                            html.Section(
+                                [
+                                    html.H2("Historical Baseline"),
+                                    html.P(
+                                        "Upload a CSV to include the total repair amount of projects "
+                                        "carried over from previous years in the overall repair rate calculation.",
+                                        className="help-text",
+                                    ),
+                                    html.Button(
+                                        "Download Template CSV",
+                                        id="download-baseline-template-btn",
                                         className="secondary-btn",
                                     ),
-                                    html.Button("Refresh Data", id="refresh-dashboard-btn", className="secondary-btn"),
+                                    dcc.Download(id="baseline-template-download"),
+                                    dcc.Store(id="parsed-baseline-store"),
+                                    dcc.Upload(
+                                        id="baseline-upload",
+                                        children=html.Div(
+                                            ["Drag and drop the CSV file here or ", html.A("select a file")]
+                                        ),
+                                        className="upload-box",
+                                        multiple=False,
+                                    ),
+                                    html.Div(id="baseline-validation-result"),
+                                    html.Div(id="baseline-preview-table"),
+                                    html.Button(
+                                        "Confirm Baseline Import",
+                                        id="confirm-baseline-import-btn",
+                                        className="primary-btn",
+                                        style={"display": "none"},
+                                    ),
+                                    html.Div(id="baseline-import-confirm-result"),
                                 ],
-                                className="button-group",
+                                className="card",
                             ),
                         ],
-                        className="section-header-row",
                     ),
-                    dcc.Download(id="pdf-report-download"),
-                    dcc.Loading(html.Div(id="dashboard-content")),
-                ],
-                className="card",
-            ),
-            html.Section(
-                [
-                    html.H2("4) Pipe-Level Analysis"),
-                    html.P(
-                        "Per-pipe repair data parsed from each project sheet during "
-                        "Excel import. Pick a report date and a project sheet to inspect.",
-                        className="help-text",
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [html.Label("Report Date"), dcc.Dropdown(id="pipe-date-dropdown")],
-                                className="filter-field",
-                            ),
-                            html.Div(
-                                [html.Label("Project Sheet"), dcc.Dropdown(id="pipe-sheet-dropdown")],
-                                className="filter-field",
+                    dcc.Tab(
+                        label="Dashboard",
+                        value="tab-dashboard",
+                        style=_TAB_STYLE,
+                        selected_style=_TAB_SELECTED_STYLE,
+                        children=[
+                            html.Section(
+                                [
+                                    html.Div(
+                                        [
+                                            html.H2("Dashboard"),
+                                            html.Div(
+                                                [
+                                                    html.Button(
+                                                        "Download PDF Report",
+                                                        id="download-pdf-report-btn",
+                                                        className="secondary-btn",
+                                                    ),
+                                                    html.Button(
+                                                        "Refresh Data",
+                                                        id="refresh-dashboard-btn",
+                                                        className="secondary-btn",
+                                                    ),
+                                                ],
+                                                className="button-group",
+                                            ),
+                                        ],
+                                        className="section-header-row",
+                                    ),
+                                    dcc.Download(id="pdf-report-download"),
+                                    dcc.Loading(html.Div(id="dashboard-content")),
+                                ],
+                                className="card",
                             ),
                         ],
-                        className="filter-row",
                     ),
-                    dcc.Loading(html.Div(id="pipe-analysis-content")),
+                    dcc.Tab(
+                        label="Pipe Analysis",
+                        value="tab-pipe",
+                        style=_TAB_STYLE,
+                        selected_style=_TAB_SELECTED_STYLE,
+                        children=[
+                            html.Section(
+                                [
+                                    html.H2("Pipe-Level Analysis"),
+                                    html.P(
+                                        "Per-pipe repair data parsed from each project sheet during "
+                                        "Excel import. Pick a report date and a project sheet to inspect.",
+                                        className="help-text",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [html.Label("Report Date"), dcc.Dropdown(id="pipe-date-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                            html.Div(
+                                                [html.Label("Project Sheet"), dcc.Dropdown(id="pipe-sheet-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    dcc.Loading(html.Div(id="pipe-analysis-content")),
+                                ],
+                                className="card",
+                            ),
+                        ],
+                    ),
+                    dcc.Tab(
+                        label="Project Grouping",
+                        value="tab-groups",
+                        style=_TAB_STYLE,
+                        selected_style=_TAB_SELECTED_STYLE,
+                        children=[
+                            html.Section(
+                                [
+                                    html.H2("Project Grouping"),
+                                    html.P(
+                                        "Define named pipe-number ranges for a project sheet, for use in "
+                                        "group-level analysis. Format: \"1-20:Group A; 21-45:Group B\".",
+                                        className="help-text",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [html.Label("Project Sheet"), dcc.Dropdown(id="group-sheet-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [
+                                                    html.Label("Pipe Groups"),
+                                                    dcc.Textarea(
+                                                        id="pipe-groups-input",
+                                                        placeholder="e.g. 1-20:Team A; 21-45:Team B",
+                                                        className="group-textarea",
+                                                    ),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label("Machine Groups"),
+                                                    dcc.Textarea(
+                                                        id="machine-groups-input",
+                                                        placeholder="e.g. 1-30:Machine 1; 31-60:Machine 2",
+                                                        className="group-textarea",
+                                                    ),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    html.Button("Save Groups", id="save-groups-btn", className="primary-btn"),
+                                    html.Div(id="save-groups-result"),
+                                ],
+                                className="card",
+                            ),
+                        ],
+                    ),
                 ],
-                className="card",
             ),
         ]
     )
@@ -242,7 +391,7 @@ def handle_upload(contents, filename):
 
     preview = dash_table.DataTable(
         data=df.drop(columns=["excel_row"], errors="ignore").to_dict("records"),
-        columns=[{"name": c, "id": c} for c in df.columns if c != "excel_row"],
+        columns=_table_columns([c for c in df.columns if c != "excel_row"]),
         page_size=15,
         style_table={"overflowX": "auto"},
         style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
@@ -361,7 +510,7 @@ def handle_baseline_upload(contents, filename):
 
     preview = dash_table.DataTable(
         data=df.to_dict("records"),
-        columns=[{"name": c, "id": c} for c in df.columns],
+        columns=_table_columns(df.columns),
         page_size=15,
         style_table={"overflowX": "auto"},
         style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
@@ -522,7 +671,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     ]
     detail_table = dash_table.DataTable(
         data=latest_df[table_columns].round(4).to_dict("records"),
-        columns=[{"name": c, "id": c} for c in table_columns],
+        columns=_table_columns(table_columns),
         page_size=15,
         sort_action="native",
         filter_action="native",
@@ -616,7 +765,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
             html.H3("All Project Sheets — Summary"),
             dash_table.DataTable(
                 data=summary_table.round(4).to_dict("records"),
-                columns=[{"name": c, "id": c} for c in summary_table.columns],
+                columns=_table_columns(summary_table.columns),
                 page_size=10,
                 sort_action="native",
                 style_table={"overflowX": "auto"},
@@ -643,7 +792,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
     detail_columns = [c for c in sheet_df.columns if c != "date"]
     detail_table = dash_table.DataTable(
         data=sheet_df[detail_columns].round(4).to_dict("records"),
-        columns=[{"name": c, "id": c} for c in detail_columns],
+        columns=_table_columns(detail_columns),
         page_size=20,
         sort_action="native",
         filter_action="native",
@@ -659,3 +808,60 @@ def render_pipe_analysis(selected_date, selected_sheet):
             detail_table,
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Callback 11: Project Grouping — populate the project sheet dropdown
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("group-sheet-dropdown", "options"),
+    Output("group-sheet-dropdown", "value"),
+    Input("group-sheet-dropdown", "id"),  # fires once, on page load
+)
+def load_group_sheets(_id):
+    df = load_pipe_repair_details()
+    if df.empty:
+        return [], None
+    sheets = sorted(df["project_sheet"].unique())
+    options = [{"label": s, "value": s} for s in sheets]
+    return options, options[0]["value"] if options else None
+
+
+# ---------------------------------------------------------------------------
+# Callback 12: Project Grouping — load the saved config for a sheet
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("pipe-groups-input", "value"),
+    Output("machine-groups-input", "value"),
+    Output("save-groups-result", "children", allow_duplicate=True),
+    Input("group-sheet-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def load_group_config(selected_sheet):
+    if not selected_sheet:
+        return "", "", None
+    config = load_project_group_config(selected_sheet, selected_sheet, "")
+    if not config:
+        return "", "", None
+    return config.get("pipe_groups", ""), config.get("machine_groups", ""), None
+
+
+# ---------------------------------------------------------------------------
+# Callback 13: Project Grouping — save the group spec for a sheet
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("save-groups-result", "children"),
+    Input("save-groups-btn", "n_clicks"),
+    State("group-sheet-dropdown", "value"),
+    State("pipe-groups-input", "value"),
+    State("machine-groups-input", "value"),
+    prevent_initial_call=True,
+)
+def save_groups(n_clicks, selected_sheet, pipe_groups, machine_groups):
+    if not n_clicks or not selected_sheet:
+        return dash.no_update
+    upsert_project_group_config(selected_sheet, selected_sheet, "", pipe_groups or "", machine_groups or "")
+    return html.Div(f"✅ Groups saved for {selected_sheet}.", className="success-text")
