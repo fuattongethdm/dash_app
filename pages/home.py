@@ -724,6 +724,12 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     latest_date = master_df["date"].max()
     latest_df = master_df[master_df["date"] == latest_date]
     latest_df = apply_meter_based_repair_ratios(latest_df)
+    # project_no alone repeats within a day (same project, different
+    # dimensions) — charts that plot per-row project data need a unique
+    # label per row, or a categorical axis shared by two traces (e.g. the
+    # pareto bar+line) will collapse repeated labels onto one x position
+    # and the line will zigzag/fold back on itself.
+    latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
 
     overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
     current_overall_ratio = (
@@ -784,9 +790,9 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     worst_fig = px.bar(
         worst,
         x="repair_ratio",
-        y="project_no",
+        y="project_label",
         orientation="h",
-        labels={"repair_ratio": "Repair Ratio", "project_no": "Project"},
+        labels={"repair_ratio": "Repair Ratio", "project_label": "Project"},
         title="Top 10 Projects by Repair Ratio (Latest Day)",
     )
     worst_fig.update_traces(
@@ -802,13 +808,13 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     worst_fig.update_xaxes(tickformat=".0%")
 
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
-    skelp_df = latest_df[["project_no", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
+    skelp_df = latest_df[["project_label", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
     skelp_df["skelp_impact"] = skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]
     skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_no"],
+            x=skelp_top["project_label"],
             y=skelp_top["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
@@ -817,7 +823,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_no"],
+            x=skelp_top["project_label"],
             y=skelp_top["skelp_impact"],
             name="Skelp Impact",
             marker_color=COLOR_SECONDARY,
@@ -831,6 +837,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
+        xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label"].tolist()),
     )
     skelp_fig.update_xaxes(tickangle=-45)
     skelp_fig.update_yaxes(tickformat=".0%")
@@ -881,7 +888,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     dimension_ratio_fig.update_yaxes(tickformat=".1%")
 
     # --- Repair amount pareto: which projects drive most of the total ---
-    pareto_df = latest_df[["project_no", "total_repair_amount"]].sort_values(
+    pareto_df = latest_df[["project_label", "total_repair_amount"]].sort_values(
         "total_repair_amount", ascending=False
     ).reset_index(drop=True)
     pareto_df["cumulative_pct"] = (
@@ -890,7 +897,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     pareto_fig = go.Figure()
     pareto_fig.add_trace(
         go.Bar(
-            x=pareto_df["project_no"],
+            x=pareto_df["project_label"],
             y=pareto_df["total_repair_amount"],
             name="Repair Amount (m)",
             marker_color=COLOR_COIL,
@@ -899,7 +906,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     pareto_fig.add_trace(
         go.Scatter(
-            x=pareto_df["project_no"],
+            x=pareto_df["project_label"],
             y=pareto_df["cumulative_pct"],
             name="Cumulative %",
             yaxis="y2",
@@ -916,6 +923,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         margin=dict(l=40, r=40, t=50, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hoverlabel=HOVER_STYLE,
+        # Duplicate project numbers (same project, different dimensions)
+        # mean the x labels aren't unique — pin the category order explicitly
+        # so the bar and the cumulative line can't be reshuffled onto the
+        # same tick and zigzag.
+        xaxis=dict(categoryorder="array", categoryarray=pareto_df["project_label"].tolist()),
     )
     pareto_fig.update_xaxes(tickangle=-45)
 
