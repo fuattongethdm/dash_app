@@ -25,8 +25,10 @@ from dash import Input, Output, State, callback, dash_table, dcc, html
 
 from baseline import baseline_template_csv, parse_historical_baseline_csv
 from calculations import (
+    METERS_PER_FOOT,
     apply_meter_based_repair_ratios,
     daily_weighted_repair_ratios,
+    daily_weighted_repair_ratios_for_type,
     repair_amount_trend_data,
 )
 from database import (
@@ -227,6 +229,26 @@ def layout():
                                     ),
                                     dcc.Download(id="pdf-report-download"),
                                     dcc.Loading(html.Div(id="dashboard-content")),
+                                ],
+                                className="card",
+                            ),
+                            html.Section(
+                                [
+                                    html.H2("Project Trend"),
+                                    html.P(
+                                        "Select a project to see its repair ratio over all report dates.",
+                                        className="help-text",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [html.Label("Project"), dcc.Dropdown(id="project-trend-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    dcc.Loading(html.Div(id="project-trend-content")),
                                 ],
                                 className="card",
                             ),
@@ -751,6 +773,87 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     pareto_fig.update_xaxes(tickangle=-45)
 
+    production_types = sorted(master_df["production_type"].dropna().unique())
+    _TYPE_COLORS = {"Coil": "#2563eb", "Plate": "#f97316"}
+
+    # --- Repair rate trend by production type ---
+    type_trend_fig = go.Figure()
+    for p_type in production_types:
+        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df)
+        type_trend_fig.add_trace(
+            go.Scatter(
+                x=type_trend["date"],
+                y=type_trend["weighted_repair_ratio"] * 100,
+                mode="lines+markers",
+                name=p_type,
+                line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
+            )
+        )
+    type_trend_fig.update_layout(
+        title="Repair Rate Trend by Production Type",
+        yaxis_title="Repair Rate (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+    )
+    type_trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
+    # --- Weighted repair ratio by production type (latest day) ---
+    type_rows = []
+    for p_type in production_types:
+        type_latest = latest_df[latest_df["production_type"] == p_type]
+        denom = type_latest["repaired_spiral_length"].sum() * METERS_PER_FOOT
+        ratio = type_latest["total_repair_amount"].sum() / denom if denom else 0
+        type_rows.append({"production_type": p_type, "weighted_ratio": ratio})
+    type_analysis_fig = px.bar(
+        pd.DataFrame(type_rows),
+        x="production_type",
+        y="weighted_ratio",
+        labels={"production_type": "Production Type", "weighted_ratio": "Weighted Repair Ratio"},
+        title="Weighted Repair Ratio by Production Type (Latest Day)",
+    )
+    type_analysis_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    type_analysis_fig.update_yaxes(tickformat=".1%")
+
+    # --- Weighted repair ratio by status (latest day) ---
+    status_rows = []
+    for status in sorted(latest_df["project_status"].dropna().unique()):
+        status_latest = latest_df[latest_df["project_status"] == status]
+        denom = status_latest["repaired_spiral_length"].sum() * METERS_PER_FOOT
+        ratio = status_latest["total_repair_amount"].sum() / denom if denom else 0
+        status_rows.append({"project_status": status, "weighted_ratio": ratio})
+    status_fig = px.bar(
+        pd.DataFrame(status_rows),
+        x="project_status",
+        y="weighted_ratio",
+        labels={"project_status": "Status", "weighted_ratio": "Weighted Repair Ratio"},
+        title="Weighted Repair Ratio by Status (Latest Day)",
+    )
+    status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    status_fig.update_yaxes(tickformat=".1%")
+
+    # --- Current period vs historical baseline ---
+    current_denom = latest_df["repaired_spiral_length"].sum() * METERS_PER_FOOT
+    current_ratio_value = latest_df["total_repair_amount"].sum() / current_denom if current_denom else 0
+    baseline_ratio_value = 0
+    if not baseline_df.empty:
+        baseline_denom = baseline_df["repaired_spiral_length"].sum() * METERS_PER_FOOT
+        baseline_ratio_value = baseline_df["total_repair_amount"].sum() / baseline_denom if baseline_denom else 0
+    benchmark_fig = px.bar(
+        pd.DataFrame(
+            {
+                "period": ["Current (Latest Day)", "Historical Baseline"],
+                "ratio": [current_ratio_value, baseline_ratio_value],
+            }
+        ),
+        x="period",
+        y="ratio",
+        labels={"period": "", "ratio": "Weighted Repair Ratio"},
+        title="Current vs Historical Baseline Repair Ratio",
+    )
+    benchmark_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    benchmark_fig.update_yaxes(tickformat=".1%")
+
     # --- Latest day detail table ---
     table_columns = [
         "project_no",
@@ -789,6 +892,15 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 className="chart-row",
             ),
             dcc.Graph(figure=pareto_fig),
+            dcc.Graph(figure=type_trend_fig),
+            html.Div(
+                [
+                    dcc.Graph(figure=type_analysis_fig, className="chart-half"),
+                    dcc.Graph(figure=status_fig, className="chart-half"),
+                ],
+                className="chart-row",
+            ),
+            dcc.Graph(figure=benchmark_fig),
             html.H3("Latest Day — Project Details"),
             detail_table,
         ]
@@ -800,6 +912,66 @@ def _summary_card(label: str, value: str) -> html.Div:
         [html.Div(value, className="summary-value"), html.Div(label, className="summary-label")],
         className="summary-card",
     )
+
+
+# ---------------------------------------------------------------------------
+# Callback X1: Project Trend — populate the project dropdown
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("project-trend-dropdown", "options"),
+    Output("project-trend-dropdown", "value"),
+    Input("project-trend-dropdown", "id"),  # fires once, on page load
+    Input("import-confirm-result", "children"),  # refresh after a new import
+)
+def load_project_trend_options(_id, _import_result):
+    master_df = load_master_data()
+    if master_df.empty:
+        return [], None
+    projects = sorted(master_df["project_no"].dropna().unique())
+    options = [{"label": p, "value": p} for p in projects]
+    return options, options[0]["value"] if options else None
+
+
+# ---------------------------------------------------------------------------
+# Callback X2: Project Trend — render the trend chart for the selected project
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("project-trend-content", "children"),
+    Input("project-trend-dropdown", "value"),
+)
+def render_project_trend(selected_project):
+    if not selected_project:
+        return html.P("No data available. Import an Excel file first.")
+
+    master_df = load_master_data()
+    project_df = master_df[master_df["project_no"] == selected_project].copy()
+    if project_df.empty:
+        return html.P("No data available for this project.")
+
+    project_df = apply_meter_based_repair_ratios(project_df).sort_values("date")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=project_df["date"],
+            y=project_df["repair_ratio"] * 100,
+            mode="lines+markers",
+            name="Repair Ratio (%)",
+            line=dict(color="#2563eb", width=3),
+        )
+    )
+    fig.update_layout(
+        title=f"Repair Ratio Trend — {selected_project}",
+        yaxis_title="Repair Ratio (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+    )
+    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
+    return dcc.Graph(figure=fig)
 
 
 # ---------------------------------------------------------------------------
