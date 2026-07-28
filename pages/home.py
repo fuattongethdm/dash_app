@@ -129,7 +129,7 @@ TEXT_COLUMNS = {
     "surface_state",
 }
 # Whole-number counts: no decimal formatting.
-INTEGER_COLUMNS = {"qty", "pipe_no", "repair_count", "pipe_count", "project_count"}
+INTEGER_COLUMNS = {"id", "qty", "pipe_no", "repair_count", "pipe_count", "project_count"}
 
 
 def _table_columns(columns) -> list[dict]:
@@ -208,16 +208,23 @@ def layout():
                                         className="upload-box",
                                         multiple=False,
                                     ),
-                                    html.Div(id="upload-validation-result"),
-                                    html.Div(id="upload-preview-table"),
-                                    html.Div(id="pipe-parse-summary"),
+                                    dcc.Loading(
+                                        html.Div(
+                                            [
+                                                html.Div(id="upload-validation-result"),
+                                                html.Div(id="upload-preview-table"),
+                                                html.Div(id="pipe-parse-summary"),
+                                            ]
+                                        ),
+                                        type="circle",
+                                    ),
                                     html.Button(
                                         "Confirm Import",
                                         id="confirm-import-btn",
                                         className="primary-btn",
                                         style={"display": "none"},
                                     ),
-                                    html.Div(id="import-confirm-result"),
+                                    dcc.Loading(html.Div(id="import-confirm-result"), type="circle"),
                                 ],
                                 className="card",
                             ),
@@ -244,15 +251,22 @@ def layout():
                                         className="upload-box",
                                         multiple=False,
                                     ),
-                                    html.Div(id="baseline-validation-result"),
-                                    html.Div(id="baseline-preview-table"),
+                                    dcc.Loading(
+                                        html.Div(
+                                            [
+                                                html.Div(id="baseline-validation-result"),
+                                                html.Div(id="baseline-preview-table"),
+                                            ]
+                                        ),
+                                        type="circle",
+                                    ),
                                     html.Button(
                                         "Confirm Baseline Import",
                                         id="confirm-baseline-import-btn",
                                         className="primary-btn",
                                         style={"display": "none"},
                                     ),
-                                    html.Div(id="baseline-import-confirm-result"),
+                                    dcc.Loading(html.Div(id="baseline-import-confirm-result"), type="circle"),
                                 ],
                                 className="card",
                             ),

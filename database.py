@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +194,25 @@ def _get_supabase_client():
     return create_client(url, key)
 
 
+def _execute_with_retry(query, retries: int = 2, delay: float = 0.6):
+    """Run a Supabase query, retrying transient failures a couple of times.
+
+    Supabase occasionally rejects a request with a "JWT issued at future"
+    auth error with no persistent cause (the local clock is correct) —
+    without a retry, that single blip fails the whole callback, and in
+    production (no dev error overlay) it just looks like the app froze.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return query.execute()
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, retried below
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(delay)
+    raise last_exc
+
+
 def _fetch_supabase_table(table_name: str, order_columns: tuple[str, ...], page_size: int = 1000) -> list[dict[str, Any]]:
     client = _get_supabase_client()
     rows: list[dict[str, Any]] = []
@@ -200,7 +220,7 @@ def _fetch_supabase_table(table_name: str, order_columns: tuple[str, ...], page_
         query = client.table(table_name).select("*")
         for column in order_columns:
             query = query.order(column)
-        response = query.range(start, start + page_size - 1).execute()
+        response = _execute_with_retry(query.range(start, start + page_size - 1))
         rows.extend(response.data)
         if len(response.data) < page_size:
             break
@@ -234,14 +254,13 @@ def load_project_group_config(
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
         try:
-            response = (
+            response = _execute_with_retry(
                 client.table(PROJECT_GROUP_CONFIG_TABLE_NAME)
                 .select("pipe_groups,machine_groups")
                 .eq("project_sheet", project_sheet)
                 .eq("project_no", project_no)
                 .eq("dimensions", dimensions)
                 .limit(1)
-                .execute()
             )
         except Exception as exc:
             if PROJECT_GROUP_CONFIG_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
@@ -292,10 +311,12 @@ def upsert_project_group_config(
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        client.table(PROJECT_GROUP_CONFIG_TABLE_NAME).upsert(
-            record,
-            on_conflict="project_sheet,project_no,dimensions",
-        ).execute()
+        _execute_with_retry(
+            client.table(PROJECT_GROUP_CONFIG_TABLE_NAME).upsert(
+                record,
+                on_conflict="project_sheet,project_no,dimensions",
+            )
+        )
         return 1
 
     should_close = conn is None
@@ -351,11 +372,8 @@ def get_existing_keys(df: pd.DataFrame, conn: sqlite3.Connection | None = None) 
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        response = (
-            client.table(TABLE_NAME)
-            .select("date,project_no,dimensions")
-            .in_("date", dates)
-            .execute()
+        response = _execute_with_retry(
+            client.table(TABLE_NAME).select("date,project_no,dimensions").in_("date", dates)
         )
         return {(row["date"], row["project_no"], row["dimensions"]) for row in response.data}
 
@@ -377,7 +395,7 @@ def upsert_repair_rates(df: pd.DataFrame, conn: sqlite3.Connection | None = None
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        client.table(TABLE_NAME).upsert(records, on_conflict="date,project_no,dimensions").execute()
+        _execute_with_retry(client.table(TABLE_NAME).upsert(records, on_conflict="date,project_no,dimensions"))
         return len(records)
 
     should_close = conn is None
@@ -418,10 +436,12 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
         client = _get_supabase_client()
         for start in range(0, len(records), 500):
             batch = records[start : start + 500]
-            client.table(PIPE_TABLE_NAME).upsert(
-                batch,
-                on_conflict="date,project_sheet,block_cell",
-            ).execute()
+            _execute_with_retry(
+                client.table(PIPE_TABLE_NAME).upsert(
+                    batch,
+                    on_conflict="date,project_sheet,block_cell",
+                )
+            )
         return len(records)
 
     should_close = conn is None
@@ -441,12 +461,11 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
             rows: list[dict[str, Any]] = []
             page_size = 1000
             for start in range(0, 100_000, page_size):
-                response = (
+                response = _execute_with_retry(
                     client.table(PIPE_TABLE_NAME)
                     .select("*")
                     .order("date")
                     .range(start, start + page_size - 1)
-                    .execute()
                 )
                 rows.extend(response.data)
                 if len(response.data) < page_size:
@@ -475,13 +494,12 @@ def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | 
             rows: list[dict[str, Any]] = []
             page_size = 1000
             for start in range(0, 100_000, page_size):
-                response = (
+                response = _execute_with_retry(
                     client.table(PIPE_TABLE_NAME)
                     .select("*")
                     .eq("date", date_text)
                     .order("project_sheet")
                     .range(start, start + page_size - 1)
-                    .execute()
                 )
                 rows.extend(response.data)
                 if len(response.data) < page_size:
@@ -521,7 +539,7 @@ def upsert_historical_baselines(df: pd.DataFrame, conn: sqlite3.Connection | Non
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        client.table(BASELINE_TABLE_NAME).upsert(records, on_conflict="project_no,dimensions").execute()
+        _execute_with_retry(client.table(BASELINE_TABLE_NAME).upsert(records, on_conflict="project_no,dimensions"))
         return len(records)
 
     should_close = conn is None
