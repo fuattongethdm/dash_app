@@ -22,6 +22,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dash_table, dcc, html
+from dash.dash_table.Format import Format, Scheme
 
 from baseline import baseline_template_csv, parse_historical_baseline_csv
 from calculations import (
@@ -80,23 +81,80 @@ COLUMN_LABELS = {
     "surface_state": "Surface State",
 }
 
-# Ratio columns are displayed as percentages instead of raw decimals.
+# Ratio columns are displayed as percentages instead of raw decimals. The
+# underlying value is kept numeric (via dash_table's own Format, not a
+# formatted string) so native sort/filter still compare numerically instead
+# of alphabetically — a string "10.24%" sorts/filters *before* "5.00%".
 PERCENT_COLUMNS = {"repair_ratio", "repair_ratio_incl_skelp", "avg_repair_ratio", "max_repair_ratio"}
+PERCENT_FORMAT = Format(scheme=Scheme.percentage, precision=2)
+NUMERIC_FORMAT = Format(scheme=Scheme.fixed, precision=2)
+
+TABLE_HEADER_STYLE = {
+    "backgroundColor": "#f4f6f8",
+    "fontWeight": "700",
+    "color": "var(--color-text)",
+    "borderBottom": "2px solid #cbd5e1",
+    "textAlign": "left",
+}
+TABLE_CELL_STYLE = {"fontFamily": "inherit", "fontSize": "13px", "padding": "8px 10px"}
+TABLE_CONDITIONAL_STYLE = [{"if": {"row_index": "odd"}, "backgroundColor": "#f8fafc"}]
+
+# Consistent hover-box styling across all charts: white background with a
+# light border, instead of Plotly's default (a box the same color as the
+# trace, which is hard to read against a same-colored bar/line).
+HOVER_STYLE = dict(
+    bgcolor="white",
+    bordercolor="#e2e8f0",
+    font=dict(size=12, family="Inter, Segoe UI, system-ui, sans-serif", color="#1e293b"),
+)
+
+# One consistent meaning per color across the whole dashboard.
+COLOR_COIL = "#2563eb"
+COLOR_PLATE = "#7c3aed"
+COLOR_SECONDARY = "#f97316"
+COLOR_MUTED = "#94a3b8"
+
+
+TEXT_COLUMNS = {
+    "date",
+    "project_no",
+    "dimensions",
+    "project_status",
+    "production_type",
+    "project_sheet",
+    "block_cell",
+    "repair_category",
+    "surface_state",
+}
+# Whole-number counts: no decimal formatting.
+INTEGER_COLUMNS = {"qty", "pipe_no", "repair_count", "pipe_count", "project_count"}
 
 
 def _table_columns(columns) -> list[dict]:
-    return [{"name": COLUMN_LABELS.get(c, c.replace("_", " ").title()), "id": c} for c in columns]
+    cols = []
+    for c in columns:
+        name = COLUMN_LABELS.get(c, c.replace("_", " ").title())
+        if c in PERCENT_COLUMNS:
+            cols.append({"name": name, "id": c, "type": "numeric", "format": PERCENT_FORMAT})
+        elif c in TEXT_COLUMNS:
+            cols.append({"name": name, "id": c})
+        elif c in INTEGER_COLUMNS:
+            cols.append({"name": name, "id": c, "type": "numeric"})
+        else:
+            cols.append({"name": name, "id": c, "type": "numeric", "format": NUMERIC_FORMAT})
+    return cols
 
 
 def _table_records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
-    """Format a DataFrame for display: ratio columns as percentages (2
-    decimals), other numeric columns rounded to 2 decimals."""
+    """Round numeric columns for display. Percent columns keep their raw
+    0-1 fraction — the column's Format (see _table_columns) renders that as
+    a percentage, so filtering/sorting stays numeric rather than string."""
     out = df[columns].copy()
     for col in columns:
         if col in PERCENT_COLUMNS:
-            out[col] = out[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
-        elif pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].round(2)
+            continue
+        if pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].round(4)
     return out.to_dict("records")
 
 
@@ -400,6 +458,10 @@ def _validation_summary(report) -> html.Div:
     return html.Div(children, className="validation-box ok" if report.ok else "validation-box fail")
 
 
+def _empty_state(message: str) -> html.Div:
+    return html.Div(message, className="empty-state")
+
+
 def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
     if errors:
         return html.Div(
@@ -455,7 +517,9 @@ def handle_upload(contents, filename):
         columns=_table_columns(preview_columns),
         page_size=15,
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
     pipe_summary = None
@@ -574,7 +638,9 @@ def handle_baseline_upload(contents, filename):
         columns=_table_columns(df.columns),
         page_size=15,
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
     return (
@@ -649,7 +715,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     master_df = load_master_data()
 
     if master_df.empty:
-        return html.P("No data in the database yet. Upload and import an Excel file first.")
+        return _empty_state("No data in the database yet. Upload and import an Excel file first.")
 
     baseline_df = load_historical_baselines()
     baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
@@ -683,7 +749,8 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             y=overall_ratio["weighted_repair_ratio"] * 100,
             mode="lines+markers",
             name="Repair Rate (%)",
-            line=dict(color="#2563eb", width=3),
+            line=dict(color=COLOR_COIL, width=3),
+            hovertemplate="%{x|%d.%m.%Y}<br>Repair Rate: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     trend_fig.update_layout(
@@ -692,6 +759,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         xaxis_title="Date",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
     )
     trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
@@ -704,7 +772,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"date": "Date", "daily_repair_amount_display": "Daily Repair Amount (m)"},
         title="Daily Repair Amount",
     )
-    bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    bar_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{x|%d.%m.%Y}<br>Daily Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+    )
+    bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     bar_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
     # --- Worst-performing projects (latest day) ---
@@ -717,11 +789,17 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"repair_ratio": "Repair Ratio", "project_no": "Project"},
         title="Top 10 Projects by Repair Ratio (Latest Day)",
     )
+    worst_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{y}<br>Repair Ratio: <b>%{x:.2%}</b><extra></extra>",
+    )
     worst_fig.update_layout(
         template="plotly_white",
         yaxis=dict(autorange="reversed"),
         margin=dict(l=120, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
     )
+    worst_fig.update_xaxes(tickformat=".0%")
 
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
     skelp_df = latest_df[["project_no", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
@@ -729,10 +807,22 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
-        go.Bar(x=skelp_top["project_no"], y=skelp_top["repair_ratio"], name="Repair Ratio", marker_color="#2563eb")
+        go.Bar(
+            x=skelp_top["project_no"],
+            y=skelp_top["repair_ratio"],
+            name="Repair Ratio",
+            marker_color=COLOR_COIL,
+            hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+        )
     )
     skelp_fig.add_trace(
-        go.Bar(x=skelp_top["project_no"], y=skelp_top["skelp_impact"], name="Skelp Impact", marker_color="#f97316")
+        go.Bar(
+            x=skelp_top["project_no"],
+            y=skelp_top["skelp_impact"],
+            name="Skelp Impact",
+            marker_color=COLOR_SECONDARY,
+            hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2%}</b><extra></extra>",
+        )
     )
     skelp_fig.update_layout(
         barmode="stack",
@@ -740,8 +830,10 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         yaxis_title="Repair Ratio",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
+        hoverlabel=HOVER_STYLE,
     )
     skelp_fig.update_xaxes(tickangle=-45)
+    skelp_fig.update_yaxes(tickformat=".0%")
 
     # --- Repair amount by dimension ---
     dimension_df = (
@@ -761,7 +853,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"dimensions": "Dimensions", "total_repair_amount": "Total Repair Amount (m)"},
         title="Repair Amount by Dimension (Latest Day)",
     )
-    dimension_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    dimension_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{x}<br>Total Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+    )
+    dimension_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
     dimension_fig.update_xaxes(tickangle=-45)
 
     # --- Weighted repair ratio by dimension ---
@@ -776,7 +872,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"dimensions": "Dimensions", "weighted_ratio": "Weighted Repair Ratio"},
         title="Weighted Repair Ratio by Dimension (Latest Day)",
     )
-    dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    dimension_ratio_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
     dimension_ratio_fig.update_xaxes(tickangle=-45)
     dimension_ratio_fig.update_yaxes(tickformat=".1%")
 
@@ -793,7 +893,8 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             x=pareto_df["project_no"],
             y=pareto_df["total_repair_amount"],
             name="Repair Amount (m)",
-            marker_color="#2563eb",
+            marker_color=COLOR_COIL,
+            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
         )
     )
     pareto_fig.add_trace(
@@ -802,8 +903,9 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             y=pareto_df["cumulative_pct"],
             name="Cumulative %",
             yaxis="y2",
-            line=dict(color="#f97316", width=2),
+            line=dict(color=COLOR_SECONDARY, width=2),
             mode="lines+markers",
+            hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     pareto_fig.update_layout(
@@ -813,11 +915,12 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
         margin=dict(l=40, r=40, t=50, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hoverlabel=HOVER_STYLE,
     )
     pareto_fig.update_xaxes(tickangle=-45)
 
     production_types = sorted(master_df["production_type"].dropna().unique())
-    _TYPE_COLORS = {"Coil": "#2563eb", "Plate": "#f97316"}
+    _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
 
     # --- Repair rate trend by production type ---
     type_trend_fig = go.Figure()
@@ -830,6 +933,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 mode="lines+markers",
                 name=p_type,
                 line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
+                hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
     type_trend_fig.update_layout(
@@ -838,6 +942,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         xaxis_title="Date",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
     )
     type_trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
@@ -852,10 +957,15 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         pd.DataFrame(type_rows),
         x="production_type",
         y="weighted_ratio",
+        color="production_type",
+        color_discrete_map=_TYPE_COLORS,
         labels={"production_type": "Production Type", "weighted_ratio": "Weighted Repair Ratio"},
         title="Weighted Repair Ratio by Production Type (Latest Day)",
     )
-    type_analysis_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    type_analysis_fig.update_traces(hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>")
+    type_analysis_fig.update_layout(
+        template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), showlegend=False, hoverlabel=HOVER_STYLE
+    )
     type_analysis_fig.update_yaxes(tickformat=".1%")
 
     # --- Weighted repair ratio by status (latest day) ---
@@ -872,7 +982,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"project_status": "Status", "weighted_ratio": "Weighted Repair Ratio"},
         title="Weighted Repair Ratio by Status (Latest Day)",
     )
-    status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    status_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     status_fig.update_yaxes(tickformat=".1%")
 
     # --- Current period vs historical baseline ---
@@ -894,7 +1008,11 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         labels={"period": "", "ratio": "Weighted Repair Ratio"},
         title="Current vs Historical Baseline Repair Ratio",
     )
-    benchmark_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    benchmark_fig.update_traces(
+        marker_color=[COLOR_COIL, COLOR_MUTED],
+        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    benchmark_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     benchmark_fig.update_yaxes(tickformat=".1%")
 
     # --- Latest day detail table ---
@@ -913,7 +1031,9 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         sort_action="native",
         filter_action="native",
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
     return html.Div(
@@ -987,12 +1107,12 @@ def load_project_trend_options(_id, _import_result):
 )
 def render_project_trend(selected_project):
     if not selected_project:
-        return html.P("No data available. Import an Excel file first.")
+        return _empty_state("No data available. Import an Excel file first.")
 
     master_df = load_master_data()
     project_df = master_df[master_df["project_no"] == selected_project].copy()
     if project_df.empty:
-        return html.P("No data available for this project.")
+        return _empty_state("No data available for this project.")
 
     project_df = apply_meter_based_repair_ratios(project_df).sort_values("date")
 
@@ -1003,7 +1123,8 @@ def render_project_trend(selected_project):
             y=project_df["repair_ratio"] * 100,
             mode="lines+markers",
             name="Repair Ratio (%)",
-            line=dict(color="#2563eb", width=3),
+            line=dict(color=COLOR_COIL, width=3),
+            hovertemplate="%{x|%d.%m.%Y}<br>Repair Ratio: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     fig.update_layout(
@@ -1012,6 +1133,7 @@ def render_project_trend(selected_project):
         xaxis_title="Date",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
     )
     fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
 
@@ -1069,7 +1191,7 @@ def load_pipe_sheets(selected_date):
 )
 def render_pipe_analysis(selected_date, selected_sheet):
     if not selected_date:
-        return html.P("No pipe-level data in the database yet. Import an Excel file first.")
+        return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
     df = load_pipe_repair_details()
     day_df = df[df["date"].dt.date.astype(str) == selected_date]
@@ -1085,7 +1207,9 @@ def render_pipe_analysis(selected_date, selected_sheet):
                 page_size=10,
                 sort_action="native",
                 style_table={"overflowX": "auto"},
-                style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+                style_cell=TABLE_CELL_STYLE,
+                style_header=TABLE_HEADER_STYLE,
+                style_data_conditional=TABLE_CONDITIONAL_STYLE,
             ),
         ]
     )
@@ -1102,8 +1226,13 @@ def render_pipe_analysis(selected_date, selected_sheet):
         labels={"pipe_no": "Pipe No.", "repair_ratio": "Repair Ratio"},
         title=f"Top 15 Pipes by Repair Ratio — {selected_sheet}",
     )
-    worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
+    worst_fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="Pipe %{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     worst_fig.update_xaxes(type="category")
+    worst_fig.update_yaxes(tickformat=".1%")
 
     detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state", "repair_category")]
     detail_table = dash_table.DataTable(
@@ -1113,7 +1242,9 @@ def render_pipe_analysis(selected_date, selected_sheet):
         sort_action="native",
         filter_action="native",
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
     return html.Div(
@@ -1214,7 +1345,7 @@ def load_dimension_options(_id, _import_result):
 )
 def render_dimension_detail(selected_dimension):
     if not selected_dimension:
-        return html.P("No data available. Import an Excel file first.")
+        return _empty_state("No data available. Import an Excel file first.")
 
     master_df = load_master_data()
     latest_date = master_df["date"].max()
@@ -1225,7 +1356,7 @@ def render_dimension_detail(selected_dimension):
         "repair_ratio", ascending=False
     )
     if dim_df.empty:
-        return html.P("No projects found for this dimension on the latest day.")
+        return _empty_state("No projects found for this dimension on the latest day.")
 
     fig = px.bar(
         dim_df,
@@ -1234,7 +1365,11 @@ def render_dimension_detail(selected_dimension):
         labels={"project_no": "Project", "repair_ratio": "Repair Ratio"},
         title=f"Projects with Dimension {selected_dimension} (Latest Day)",
     )
-    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80))
+    fig.update_traces(
+        marker_color=COLOR_COIL,
+        hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
     fig.update_xaxes(tickangle=-45)
     fig.update_yaxes(tickformat=".1%")
 
@@ -1245,7 +1380,9 @@ def render_dimension_detail(selected_dimension):
         page_size=10,
         sort_action="native",
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
     return html.Div([dcc.Graph(figure=fig), table])

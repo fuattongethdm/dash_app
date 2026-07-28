@@ -19,7 +19,7 @@ app = Dash(
     __name__,
     use_pages=True,
     suppress_callback_exceptions=True,
-    title="Factory Tracking System",
+    title="Daily Tracking Report",
 )
 
 # Render / gunicorn looks for this variable: `gunicorn app:server`
@@ -34,7 +34,7 @@ app.layout = html.Div(
     [
         html.Header(
             [
-                html.Div("Factory Tracking System", className="app-title"),
+                html.Div("Daily Tracking Report", className="app-title"),
                 html.Nav(
                     [_nav_link(page["name"], page["path"]) for page in dash.page_registry.values()],
                     className="app-nav",

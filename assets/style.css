@@ -57,7 +57,7 @@ body {
 }
 
 .app-main {
-  max-width: 1200px;
+  max-width: 1800px;
   margin: 24px auto;
   padding: 0 24px 48px;
 }
@@ -226,6 +226,15 @@ body {
   font-weight: 600;
   color: var(--color-text-muted);
   margin-bottom: 4px;
+}
+
+.empty-state {
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--color-text-muted);
+  background: var(--color-bg);
+  border-radius: var(--radius);
+  border: 1px dashed var(--color-border);
 }
 
 .group-textarea {
