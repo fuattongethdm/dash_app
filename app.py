@@ -1,13 +1,13 @@
 """
-Ana Dash uygulaması.
+Main Dash application.
 
-Bu dosya sadece "iskelet": sayfa yönlendirme (routing) ve genel görünüm (menü,
-başlık) burada. Her modülün asıl mantığı `pages/` klasöründeki kendi
-dosyasında - böylece modüller birbirine karışmıyor, her biri bağımsız
-geliştirilip test edilebiliyor.
+This file is just the "skeleton": page routing and the overall shell (nav,
+title) live here. Each module's actual logic lives in its own file under
+`pages/` - that way modules stay independent and can be developed and
+tested separately.
 
-Render gibi bir platforma deploy ederken bu dosyadaki `server` değişkeni
-kullanılıyor (gunicorn app:server).
+When deploying to a platform like Render, the `server` variable in this
+file is used (gunicorn app:server).
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ app = Dash(
     __name__,
     use_pages=True,
     suppress_callback_exceptions=True,
-    title="Fabrika Takip Sistemi",
+    title="Factory Tracking System",
 )
 
-# Render / gunicorn bu değişkeni arıyor: `gunicorn app:server`
+# Render / gunicorn looks for this variable: `gunicorn app:server`
 server = app.server
 
 
@@ -34,7 +34,7 @@ app.layout = html.Div(
     [
         html.Header(
             [
-                html.Div("Fabrika Takip Sistemi", className="app-title"),
+                html.Div("Factory Tracking System", className="app-title"),
                 html.Nav(
                     [_nav_link(page["name"], page["path"]) for page in dash.page_registry.values()],
                     className="app-nav",
@@ -48,5 +48,5 @@ app.layout = html.Div(
 
 
 if __name__ == "__main__":
-    # Lokal geliştirme için. Production'da gunicorn kullanılacak.
+    # For local development. Production uses gunicorn.
     app.run(debug=True, host="0.0.0.0", port=8050)

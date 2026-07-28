@@ -1,15 +1,12 @@
 """
-Modül 1: Günlük Repair Rate Dashboard.
+Module 1: Daily Repair Rate Dashboard.
 
-Akış (Streamlit'teki ile birebir aynı mantık):
-  1) Kullanıcı Excel dosyasını yükler (dcc.Upload)
-  2) parser.parse_daily_repair_rate() ile okunur, validators ile doğrulanır
-  3) Doğrulama sonucu ve önizleme kullanıcıya gösterilir
-  4) "Import'u Onayla" butonuna basılınca veritabanına yazılır (upsert)
-  5) Aşağıdaki dashboard, veritabanındaki TÜM veriye göre güncellenir
-
-Not: Excel'in okunma mantığı (parser.py, validators.py) hiç değiştirilmedi -
-sadece üstündeki arayüz Streamlit yerine Dash ile yazıldı.
+Flow:
+  1) User uploads the Excel file (dcc.Upload)
+  2) Read via parser.parse_daily_repair_rate(), validated with validators
+  3) Validation result and preview are shown to the user
+  4) Clicking "Confirm Import" writes the data to the database (upsert)
+  5) The dashboard below refreshes from ALL data currently in the database
 """
 
 from __future__ import annotations
@@ -23,12 +20,18 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dash_table, dcc, html
 
+from baseline import baseline_template_csv, parse_historical_baseline_csv
 from calculations import (
     apply_meter_based_repair_ratios,
     daily_weighted_repair_ratios,
     repair_amount_trend_data,
 )
-from database import load_historical_baselines, load_master_data, upsert_repair_rates
+from database import (
+    load_historical_baselines,
+    load_master_data,
+    upsert_historical_baselines,
+    upsert_repair_rates,
+)
 from parser import parse_daily_repair_rate
 
 dash.register_page(__name__, path="/", name="Dashboard")
@@ -41,15 +44,15 @@ dash.register_page(__name__, path="/", name="Dashboard")
 def layout():
     return html.Div(
         [
-            # Parse edilen (henüz DB'ye yazılmamış) veriyi tarayıcıda tutuyoruz.
+            # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
             html.Section(
                 [
-                    html.H2("1) Günlük Excel Yükle"),
+                    html.H2("1) Upload Daily Excel"),
                     dcc.Upload(
                         id="excel-upload",
                         children=html.Div(
-                            ["Excel dosyasını buraya sürükle ya da ", html.A("dosya seç")]
+                            ["Drag and drop the Excel file here or ", html.A("select a file")]
                         ),
                         className="upload-box",
                         multiple=False,
@@ -57,7 +60,7 @@ def layout():
                     html.Div(id="upload-validation-result"),
                     html.Div(id="upload-preview-table"),
                     html.Button(
-                        "Import'u Onayla",
+                        "Confirm Import",
                         id="confirm-import-btn",
                         className="primary-btn",
                         style={"display": "none"},
@@ -68,10 +71,45 @@ def layout():
             ),
             html.Section(
                 [
+                    html.H2("2) Historical Baseline"),
+                    html.P(
+                        "Upload a CSV to include the total repair amount of projects "
+                        "carried over from previous years in the overall repair rate calculation.",
+                        className="help-text",
+                    ),
+                    html.Button(
+                        "Download Template CSV",
+                        id="download-baseline-template-btn",
+                        className="secondary-btn",
+                    ),
+                    dcc.Download(id="baseline-template-download"),
+                    dcc.Store(id="parsed-baseline-store"),
+                    dcc.Upload(
+                        id="baseline-upload",
+                        children=html.Div(
+                            ["Drag and drop the CSV file here or ", html.A("select a file")]
+                        ),
+                        className="upload-box",
+                        multiple=False,
+                    ),
+                    html.Div(id="baseline-validation-result"),
+                    html.Div(id="baseline-preview-table"),
+                    html.Button(
+                        "Confirm Baseline Import",
+                        id="confirm-baseline-import-btn",
+                        className="primary-btn",
+                        style={"display": "none"},
+                    ),
+                    html.Div(id="baseline-import-confirm-result"),
+                ],
+                className="card",
+            ),
+            html.Section(
+                [
                     html.Div(
                         [
-                            html.H2("2) Dashboard"),
-                            html.Button("Verileri Yenile", id="refresh-dashboard-btn", className="secondary-btn"),
+                            html.H2("3) Dashboard"),
+                            html.Button("Refresh Data", id="refresh-dashboard-btn", className="secondary-btn"),
                         ],
                         className="section-header-row",
                     ),
@@ -84,7 +122,7 @@ def layout():
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı fonksiyonlar
+# Helper functions
 # ---------------------------------------------------------------------------
 
 def _decode_upload(contents: str) -> io.BytesIO:
@@ -102,16 +140,31 @@ def _validation_summary(report) -> html.Div:
 
     children = [html.Ul(check_rows)]
     if report.errors:
-        children.append(html.H4(f"Hatalar ({len(report.errors)})", className="error-heading"))
+        children.append(html.H4(f"Errors ({len(report.errors)})", className="error-heading"))
         children.append(html.Ul(error_rows, className="error-list"))
     else:
-        children.append(html.P(f"{report.import_rows} satır okundu, hata yok.", className="success-text"))
+        children.append(html.P(f"{report.import_rows} rows read, no errors.", className="success-text"))
 
     return html.Div(children, className="validation-box ok" if report.ok else "validation-box fail")
 
 
+def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
+    if errors:
+        return html.Div(
+            [
+                html.H4(f"Errors ({len(errors)})", className="error-heading"),
+                html.Ul([html.Li(err) for err in errors], className="error-list"),
+            ],
+            className="validation-box fail",
+        )
+    return html.Div(
+        html.P(f"{row_count} rows read, no errors.", className="success-text"),
+        className="validation-box ok",
+    )
+
+
 # ---------------------------------------------------------------------------
-# Callback 1: Excel yükle -> parse et -> doğrula -> önizleme göster
+# Callback 1: Upload Excel -> parse -> validate -> show preview
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -130,9 +183,9 @@ def handle_upload(contents, filename):
     try:
         file_obj = _decode_upload(contents)
         df, report = parse_daily_repair_rate(file_obj)
-    except Exception as exc:  # beklenmeyen bir hata olursa uygulamayı çökertme
+    except Exception as exc:  # don't crash the app on an unexpected error
         error_box = html.Div(
-            f"Dosya okunurken beklenmeyen bir hata oluştu: {exc}",
+            f"An unexpected error occurred while reading the file: {exc}",
             className="validation-box fail",
         )
         return error_box, None, {"display": "none"}, None
@@ -152,14 +205,14 @@ def handle_upload(contents, filename):
 
     return (
         validation_box,
-        html.Div([html.H4(f"Önizleme — {filename}"), preview], className="preview-box"),
+        html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
         {"display": "inline-block"},
         df.to_json(date_format="iso", orient="split"),
     )
 
 
 # ---------------------------------------------------------------------------
-# Callback 2: "Import'u Onayla" -> veritabanına yaz
+# Callback 2: "Confirm Import" -> write to database
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -176,30 +229,117 @@ def confirm_import(n_clicks, stored_json):
     df = pd.read_json(io.StringIO(stored_json), orient="split")
     written = upsert_repair_rates(df)
     return (
-        html.Div(f"✅ {written} satır veritabanına kaydedildi.", className="success-text"),
+        html.Div(f"✅ {written} rows saved to the database.", className="success-text"),
         None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Callback 3: Dashboard'u yükle / yenile
+# Callback 3: Download baseline template CSV
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("baseline-template-download", "data"),
+    Input("download-baseline-template-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def download_baseline_template(n_clicks):
+    if not n_clicks:
+        return dash.no_update
+    return dcc.send_string(baseline_template_csv(), "historical_baseline_template.csv")
+
+
+# ---------------------------------------------------------------------------
+# Callback 4: Upload baseline CSV -> parse -> validate -> show preview
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("baseline-validation-result", "children"),
+    Output("baseline-preview-table", "children"),
+    Output("confirm-baseline-import-btn", "style"),
+    Output("parsed-baseline-store", "data"),
+    Input("baseline-upload", "contents"),
+    State("baseline-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_baseline_upload(contents, filename):
+    if contents is None:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    try:
+        file_obj = _decode_upload(contents)
+        df, errors = parse_historical_baseline_csv(file_obj)
+    except Exception as exc:  # don't crash the app on an unexpected error
+        error_box = html.Div(
+            f"An unexpected error occurred while reading the file: {exc}",
+            className="validation-box fail",
+        )
+        return error_box, None, {"display": "none"}, None
+
+    validation_box = _baseline_validation_box(errors, len(df))
+
+    if df.empty or errors:
+        return validation_box, None, {"display": "none"}, None
+
+    preview = dash_table.DataTable(
+        data=df.to_dict("records"),
+        columns=[{"name": c, "id": c} for c in df.columns],
+        page_size=15,
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": "inherit", "fontSize": "13px", "padding": "6px"},
+    )
+
+    return (
+        validation_box,
+        html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
+        {"display": "inline-block"},
+        df.to_json(date_format="iso", orient="split"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback 5: "Confirm Baseline Import" -> write to database
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("baseline-import-confirm-result", "children"),
+    Output("parsed-baseline-store", "data", allow_duplicate=True),
+    Input("confirm-baseline-import-btn", "n_clicks"),
+    State("parsed-baseline-store", "data"),
+    prevent_initial_call=True,
+)
+def confirm_baseline_import(n_clicks, stored_json):
+    if not n_clicks or not stored_json:
+        return dash.no_update, dash.no_update
+
+    df = pd.read_json(io.StringIO(stored_json), orient="split")
+    written = upsert_historical_baselines(df)
+    return (
+        html.Div(f"✅ {written} rows saved as historical baseline.", className="success-text"),
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback 6: Load / refresh the dashboard
 # ---------------------------------------------------------------------------
 
 @callback(
     Output("dashboard-content", "children"),
     Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),  # import başarılı olunca otomatik yenile
+    Input("import-confirm-result", "children"),  # auto-refresh after a successful import
+    Input("baseline-import-confirm-result", "children"),  # auto-refresh after a baseline import
 )
-def render_dashboard(_n_clicks, _import_result):
+def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     master_df = load_master_data()
 
     if master_df.empty:
-        return html.P("Henüz veritabanında veri yok. Önce bir Excel yükleyip import edin.")
+        return html.P("No data in the database yet. Upload and import an Excel file first.")
 
     baseline_df = load_historical_baselines()
     baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
 
-    # --- Üst özet kartları ---
+    # --- Top summary cards ---
     latest_date = master_df["date"].max()
     latest_df = master_df[master_df["date"] == latest_date]
     latest_df = apply_meter_based_repair_ratios(latest_df)
@@ -213,14 +353,14 @@ def render_dashboard(_n_clicks, _import_result):
 
     summary_cards = html.Div(
         [
-            _summary_card("Son Rapor Tarihi", latest_date.strftime("%d.%m.%Y")),
-            _summary_card("Aktif Proje Sayısı", str(latest_df["project_no"].nunique())),
-            _summary_card("Genel Repair Rate", f"%{current_overall_ratio * 100:.2f}"),
+            _summary_card("Last Report Date", latest_date.strftime("%d.%m.%Y")),
+            _summary_card("Active Project Count", str(latest_df["project_no"].nunique())),
+            _summary_card("Overall Repair Rate", f"%{current_overall_ratio * 100:.2f}"),
         ],
         className="summary-cards",
     )
 
-    # --- Trend grafiği: genel repair rate zaman içinde ---
+    # --- Trend chart: overall repair rate over time ---
     trend_fig = go.Figure()
     trend_fig.add_trace(
         go.Scatter(
@@ -232,33 +372,33 @@ def render_dashboard(_n_clicks, _import_result):
         )
     )
     trend_fig.update_layout(
-        title="Genel Repair Rate Trendi",
+        title="Overall Repair Rate Trend",
         yaxis_title="Repair Rate (%)",
-        xaxis_title="Tarih",
+        xaxis_title="Date",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
     )
 
-    # --- Günlük tamir miktarı (bar) ---
+    # --- Daily repair amount (bar) ---
     daily_amount = repair_amount_trend_data(master_df, display_unit="m")
     bar_fig = px.bar(
         daily_amount,
         x="date",
         y="daily_repair_amount_display",
-        labels={"date": "Tarih", "daily_repair_amount_display": "Günlük Tamir Miktarı (m)"},
-        title="Günlük Tamir Miktarı",
+        labels={"date": "Date", "daily_repair_amount_display": "Daily Repair Amount (m)"},
+        title="Daily Repair Amount",
     )
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40))
 
-    # --- En kötü performanslı projeler (son gün) ---
+    # --- Worst-performing projects (latest day) ---
     worst = latest_df.sort_values("repair_ratio", ascending=False).head(10)
     worst_fig = px.bar(
         worst,
         x="repair_ratio",
         y="project_no",
         orientation="h",
-        labels={"repair_ratio": "Repair Ratio", "project_no": "Proje"},
-        title="En Yüksek Repair Ratio'ya Sahip 10 Proje (Son Gün)",
+        labels={"repair_ratio": "Repair Ratio", "project_no": "Project"},
+        title="Top 10 Projects by Repair Ratio (Latest Day)",
     )
     worst_fig.update_layout(
         template="plotly_white",
@@ -266,7 +406,7 @@ def render_dashboard(_n_clicks, _import_result):
         margin=dict(l=120, r=20, t=50, b=40),
     )
 
-    # --- Son gün detay tablosu ---
+    # --- Latest day detail table ---
     table_columns = [
         "project_no",
         "dimensions",
@@ -296,7 +436,7 @@ def render_dashboard(_n_clicks, _import_result):
                 className="chart-row",
             ),
             dcc.Graph(figure=worst_fig),
-            html.H3("Son Gün — Proje Detayları"),
+            html.H3("Latest Day — Project Details"),
             detail_table,
         ]
     )

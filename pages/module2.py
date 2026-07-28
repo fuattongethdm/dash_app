@@ -1,8 +1,7 @@
 """
-Modül 2: Excel/PDF'den veri çekme -> yeni Excel oluşturma/düzenleme.
+Module 2: Extract data from Excel/PDF -> generate/edit a new Excel.
 
-Şimdilik yer tutucu (placeholder) - Modül 1 tamamlanıp test edildikten sonra
-buraya geçeceğiz.
+Placeholder for now - we'll move on to this once Module 1 is complete and tested.
 """
 
 from __future__ import annotations
@@ -10,14 +9,14 @@ from __future__ import annotations
 import dash
 from dash import html
 
-dash.register_page(__name__, path="/veri-donusum", name="Veri Dönüşüm")
+dash.register_page(__name__, path="/data-conversion", name="Data Conversion")
 
 
 def layout():
     return html.Div(
         [
-            html.H2("Veri Dönüşüm Modülü"),
-            html.P("Bu modül henüz geliştirilmedi — sırada Modül 1'den sonra bu var."),
+            html.H2("Data Conversion Module"),
+            html.P("This module has not been built yet — it's next after Module 1."),
         ],
         className="card",
     )

@@ -1,10 +1,11 @@
-# Fabrika Takip Sistemi — Dash Sürümü (Modül 1)
+# Factory Tracking System — Dash Version
 
-Bu, mevcut Streamlit uygulamasının **Modül 1'inin** (Excel → Dashboard) Dash ile
-yeniden yazılmış hali. Excel'in okunma mantığı (`parser.py`, `validators.py`)
-hiç değiştirilmedi — sadece arayüz Streamlit yerine Dash.
+A Dash rewrite of Module 1 (Excel → Dashboard) of the factory daily activity
+tracking tool. The Excel-reading logic (`parser.py`, `validators.py`) uses
+the same fixed cell/column contract as the original spec — only the UI is
+built with Dash instead of Streamlit.
 
-## Yerel Test (kendi bilgisayarında)
+## Local Testing (on your own machine)
 
 ```bash
 python -m venv venv
@@ -12,53 +13,70 @@ source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# .env dosyasını aç, SUPABASE_URL ve SUPABASE_KEY'i gir
-# (boş bırakırsan otomatik olarak lokal SQLite kullanır)
+# Open .env and fill in SUPABASE_URL and SUPABASE_KEY
+# (leave them empty to automatically use local SQLite)
 
 python app.py
 ```
 
-Sonra tarayıcıda `http://localhost:8050` adresine git.
+Then open `http://localhost:8050` in your browser.
 
-## Klasör Yapısı
+## Folder Structure
 
 ```
-app.py              -> Ana giriş noktası, sayfa yönlendirme (routing)
+app.py              -> Entry point, page routing
 pages/
-  home.py            -> Modül 1: Excel yükle -> Dashboard (TAMAMLANDI)
-  module2.py          -> Modül 2: yer tutucu (henüz geliştirilmedi)
-  module3.py          -> Modül 3: yer tutucu (henüz geliştirilmedi)
-assets/style.css      -> Tüm görsel tasarım burada (Dash bunu otomatik yükler)
-parser.py             -> Excel okuma mantığı (DEĞİŞMEDİ)
-validators.py          -> Doğrulama mantığı (DEĞİŞMEDİ)
-database.py            -> Supabase/SQLite veritabanı katmanı (DEĞİŞMEDİ,
-                          sadece Streamlit secrets kaldırıldı, .env kullanılıyor)
-calculations.py         -> Repair rate hesaplamaları (DEĞİŞMEDİ)
-baseline.py             -> Geçmiş yıl baseline mantığı (DEĞİŞMEDİ)
+  home.py            -> Module 1: Excel upload -> Dashboard (DONE)
+  module2.py          -> Module 2: placeholder (not yet built)
+  module3.py          -> Module 3: placeholder (not yet built)
+assets/style.css      -> All visual styling lives here (Dash auto-loads it)
+parser.py             -> Excel-reading logic
+validators.py          -> Validation logic
+database.py            -> Supabase/SQLite database layer
+calculations.py         -> Repair rate calculations
+baseline.py             -> Historical baseline logic
+supabase_setup.sql      -> Supabase schema (run once in the SQL Editor)
 ```
 
-## Render.com'a Deploy Etme
+## Database Setup (Supabase)
 
-1. Bu kodu kendi GitHub reponuza push edin.
-2. [render.com](https://render.com) üzerinde ücretsiz hesap açın, "New Web Service"
-   ile reponuzu bağlayın.
-3. Ayarlar:
+The app uses Supabase in production so data survives server restarts and
+redeploys. If `SUPABASE_URL` / `SUPABASE_KEY` are not set, it automatically
+falls back to a local SQLite file — handy for quick local testing, but data
+does not persist across deploys.
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. Open **SQL Editor** and run the full contents of `supabase_setup.sql` once.
+3. Go to **Project Settings > API** and copy the **Project URL** and the
+   **service_role** secret key (not the anon/public key — the backend needs
+   to bypass Row Level Security).
+4. Put both values into `.env`:
+   ```
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_KEY=your-service-role-key
+   ```
+
+## Deploying to Render.com
+
+1. Push this code to your own GitHub repo.
+2. Create a free account at [render.com](https://render.com) and connect a
+   "New Web Service" to your repo.
+3. Settings:
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `gunicorn app:server`
-4. **Environment** sekmesinden `SUPABASE_URL` ve `SUPABASE_KEY` değerlerini girin
-   (aynı .env'deki gibi).
-5. Deploy edin — birkaç dakika sonra size bir `.onrender.com` linki verecek.
+4. In the **Environment** tab, set `SUPABASE_URL` and `SUPABASE_KEY` (same
+   values as in `.env`).
+5. Deploy — after a few minutes you'll get a `.onrender.com` link.
 
-**Not:** Render'ın ücretsiz tier'ı 15 dakika kullanılmayınca uyur, ilk istekte
-~30-50 saniye "uyanma" süresi olabilir.
+**Note:** Render's free tier sleeps after 15 minutes of inactivity, so the
+first request afterward may take ~30-50 seconds to wake up.
 
-## Henüz Yapılmayanlar (bilerek, Modül 1'e odaklanmak için)
+## Not Yet Built
 
-- Pipe-level (boru bazlı) detay analizi
-- PDF rapor üretimi
-- Baseline (geçmiş yıl) CSV yükleme arayüzü
-- Proje gruplama (pipe/machine groups)
+- Pipe-level detail analysis
+- PDF report generation
+- Project grouping (pipe/machine groups)
 
-Bunlar orijinal Streamlit uygulamasında var, istenirse aynı mantıkla Dash'e
-taşınabilir — şimdilik çekirdek akış (Excel → doğrula → kaydet → dashboard)
-çalışır durumda olsun diye bunlara girilmedi.
+These can be added to Dash later, using the same underlying data model that
+already exists in `database.py` — the core flow (Excel → validate → save →
+dashboard) works today.

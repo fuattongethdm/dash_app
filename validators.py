@@ -101,25 +101,25 @@ def coerce_number(value: object) -> float | None:
 
 
 def validate_dataframe(df: pd.DataFrame, report: ValidationReport) -> ValidationReport:
-    report.add_check("Ana tablo satırları bulundu mu?", not df.empty)
-    report.add_check("Satır sayısı mantıklı mı?", 1 <= len(df) <= 35)
+    report.add_check("Main table rows found?", not df.empty)
+    report.add_check("Row count reasonable?", 1 <= len(df) <= 35)
     report.import_rows = len(df)
 
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    report.add_check("Zorunlu kolonlar dolu mu?", not missing)
+    report.add_check("Required columns present?", not missing)
     if missing:
-        report.add_error(f"Eksik parser kolonları: {', '.join(missing)}")
+        report.add_error(f"Missing parser columns: {', '.join(missing)}")
         return report
 
     for idx, row in df.iterrows():
         excel_row = int(row.get("excel_row", idx + 4))
         for col in ["date", "production_type", "project_no", "dimensions"]:
             if pd.isna(row[col]) or str(row[col]).strip() == "":
-                report.add_error(f"Excel satır {excel_row}: zorunlu alan boş: {col}")
+                report.add_error(f"Excel row {excel_row}: required field empty: {col}")
 
         for col in NUMERIC_COLUMNS:
             if pd.isna(row[col]):
-                report.add_error(f"Excel satır {excel_row}: numeric değil veya boş: {col}")
+                report.add_error(f"Excel row {excel_row}: not numeric or empty: {col}")
 
         rr = row.get("repair_ratio")
         rr_i = row.get("repair_ratio_incl_skelp")
@@ -127,19 +127,19 @@ def validate_dataframe(df: pd.DataFrame, report: ValidationReport) -> Validation
         amt_i = row.get("total_repair_amount_incl_skelp")
 
         if pd.notna(rr) and not 0 <= rr <= 1:
-            report.add_error(f"Excel satır {excel_row}: Repair Ratio 0-1 dışında: {rr}")
+            report.add_error(f"Excel row {excel_row}: Repair Ratio outside 0-1: {rr}")
         if pd.notna(rr_i) and not 0 <= rr_i <= 1:
-            report.add_error(f"Excel satır {excel_row}: Repair Ratio incl. Skelp 0-1 dışında: {rr_i}")
+            report.add_error(f"Excel row {excel_row}: Repair Ratio incl. Skelp outside 0-1: {rr_i}")
         if pd.notna(rr) and pd.notna(rr_i) and rr_i < rr:
-            report.add_error(f"Excel satır {excel_row}: Repair Ratio incl. Skelp, Repair Ratio değerinden küçük")
+            report.add_error(f"Excel row {excel_row}: Repair Ratio incl. Skelp is smaller than Repair Ratio")
         if pd.notna(amt) and pd.notna(amt_i) and amt_i < amt:
-            report.add_error(f"Excel satır {excel_row}: Total Repair Amount incl. Skelp normal değerden küçük")
+            report.add_error(f"Excel row {excel_row}: Total Repair Amount incl. Skelp is smaller than the normal value")
 
-    report.add_check("Numeric kolonlar numeric mi?", not any("numeric değil" in e for e in report.errors))
-    report.add_check("Ratio değerleri 0-1 arasında mı?", not any("0-1 dışında" in e for e in report.errors))
+    report.add_check("Numeric columns are numeric?", not any("not numeric" in e for e in report.errors))
+    report.add_check("Ratio values between 0-1?", not any("outside 0-1" in e for e in report.errors))
     report.add_check(
-        "Incl. Skelp değerleri normal değerlerden küçük mü?",
-        not any("incl. Skelp" in e and "küçük" in e for e in report.errors),
+        "Incl. Skelp values smaller than normal values?",
+        not any("incl. Skelp" in e and "smaller than" in e for e in report.errors),
     )
     return report
 
@@ -149,5 +149,5 @@ def mark_duplicate_counts(existing_keys: Iterable[tuple[str, str, str]], df: pd.
     incoming_keys = list(zip(df["date"].astype(str), df["project_no"], df["dimensions"]))
     report.update_rows = sum(1 for key in incoming_keys if key in existing)
     report.insert_rows = len(incoming_keys) - report.update_rows
-    report.add_check("Duplicate kontrolü yapıldı mı?", True)
+    report.add_check("Duplicate check performed?", True)
     return report

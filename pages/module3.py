@@ -1,7 +1,7 @@
 """
-Modül 3: Katalog / sunum modülü (resim yükleme, görsel içerik).
+Module 3: Catalog / presentation module (image upload, visual content).
 
-Şimdilik yer tutucu (placeholder).
+Placeholder for now.
 """
 
 from __future__ import annotations
@@ -9,14 +9,14 @@ from __future__ import annotations
 import dash
 from dash import html
 
-dash.register_page(__name__, path="/katalog", name="Katalog")
+dash.register_page(__name__, path="/catalog", name="Catalog")
 
 
 def layout():
     return html.Div(
         [
-            html.H2("Katalog Modülü"),
-            html.P("Bu modül henüz geliştirilmedi — Modül 1 ve 2'den sonra sırada bu var."),
+            html.H2("Catalog Module"),
+            html.P("This module has not been built yet — it's next after Modules 1 and 2."),
         ],
         className="card",
     )

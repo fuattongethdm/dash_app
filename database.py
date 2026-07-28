@@ -158,8 +158,7 @@ ON CONFLICT(project_sheet, project_no, dimensions) DO UPDATE SET
 
 
 def _get_config_value(name: str) -> str | None:
-    # NOT: Streamlit secrets kaldırıldı (Dash'e geçiş). Artık sadece ortam
-    # değişkenlerinden (.env veya gerçek env var) okunuyor.
+    # Read from environment variables only (.env or a real env var).
     return os.getenv(name)
 
 

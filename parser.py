@@ -93,23 +93,23 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
     try:
         wb = load_workbook(file, read_only=True, data_only=True)
     except Exception as exc:
-        report.add_check("Sheet bulundu mu?", False)
-        report.add_error(f"Excel dosyası açılamadı: {exc}")
+        report.add_check("Sheet found?", False)
+        report.add_error(f"Could not open Excel file: {exc}")
         return pd.DataFrame(), report
 
     sheet_name = _select_sheet(wb)
     if sheet_name is None:
-        report.add_check("Sheet bulundu mu?", False)
-        report.add_error(f"Daily Repair Rate sheet'i bulunamadı. Beklenen sheet adları: {', '.join(SHEET_CANDIDATES)}")
+        report.add_check("Sheet found?", False)
+        report.add_error(f"Daily Repair Rate sheet not found. Expected sheet names: {', '.join(SHEET_CANDIDATES)}")
         return pd.DataFrame(), report
 
-    report.add_check("Sheet bulundu mu?", True)
+    report.add_check("Sheet found?", True)
     ws = wb[sheet_name]
 
     report_date = coerce_report_date(ws[REPORT_DATE_CELL].value)
-    report.add_check("Tarih bulundu mu?", report_date is not None)
+    report.add_check("Date found?", report_date is not None)
     if report_date is None:
-        report.add_error(f"Rapor tarihi boş veya geçersiz: {sheet_name}!{REPORT_DATE_CELL}")
+        report.add_error(f"Report date is empty or invalid: {sheet_name}!{REPORT_DATE_CELL}")
         return pd.DataFrame(), report
 
     sections = NEW_FORMAT_SECTIONS if _is_new_format(ws) else OLD_FORMAT_SECTIONS
