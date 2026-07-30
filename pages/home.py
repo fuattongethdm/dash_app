@@ -43,7 +43,7 @@ from database import (
     upsert_project_group_config,
     upsert_repair_rates,
 )
-from parser import parse_daily_repair_rate
+from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
 from project_parser import parse_project_pipe_repairs
@@ -186,6 +186,7 @@ def layout():
             # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
             dcc.Store(id="parsed-pipe-data-store"),
+            dcc.Store(id="parsed-archive-baseline-store"),
             dcc.Tabs(
                 id="dashboard-tabs",
                 value="tab-dashboard",
@@ -511,13 +512,14 @@ def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
     Output("confirm-import-btn", "style"),
     Output("parsed-data-store", "data"),
     Output("parsed-pipe-data-store", "data"),
+    Output("parsed-archive-baseline-store", "data"),
     Input("excel-upload", "contents"),
     State("excel-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if contents is None:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     try:
         file_obj = _decode_upload(contents)
@@ -527,7 +529,7 @@ def handle_upload(contents, filename):
             f"An unexpected error occurred while reading the file: {exc}",
             className="validation-box fail",
         )
-        return error_box, None, None, {"display": "none"}, None, None
+        return error_box, None, None, {"display": "none"}, None, None, None
 
     if not df.empty and report.ok:
         # Tell the user upfront whether this import will overwrite existing
@@ -541,7 +543,7 @@ def handle_upload(contents, filename):
     validation_box = _validation_summary(report)
 
     if df.empty or not report.ok:
-        return validation_box, None, None, {"display": "none"}, None, None
+        return validation_box, None, None, {"display": "none"}, None, None, None
 
     preview_columns = [c for c in df.columns if c != "excel_row"]
     preview = dash_table.DataTable(
@@ -572,6 +574,15 @@ def handle_upload(contents, filename):
             className="help-text",
         )
 
+    archive_data_json = None
+    try:
+        archive_file_obj = _decode_upload(contents)
+        archive_df = parse_repair_rate_archive(archive_file_obj)
+        if not archive_df.empty:
+            archive_data_json = archive_df.to_json(orient="split")
+    except Exception:
+        pass  # best-effort; completed-project archive totals just won't be refreshed
+
     return (
         validation_box,
         html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
@@ -579,6 +590,7 @@ def handle_upload(contents, filename):
         {"display": "inline-block"},
         df.to_json(date_format="iso", orient="split"),
         pipe_data_json,
+        archive_data_json,
     )
 
 
@@ -590,14 +602,16 @@ def handle_upload(contents, filename):
     Output("import-confirm-result", "children"),
     Output("parsed-data-store", "data", allow_duplicate=True),
     Output("parsed-pipe-data-store", "data", allow_duplicate=True),
+    Output("parsed-archive-baseline-store", "data", allow_duplicate=True),
     Input("confirm-import-btn", "n_clicks"),
     State("parsed-data-store", "data"),
     State("parsed-pipe-data-store", "data"),
+    State("parsed-archive-baseline-store", "data"),
     prevent_initial_call=True,
 )
-def confirm_import(n_clicks, stored_json, stored_pipe_json):
+def confirm_import(n_clicks, stored_json, stored_pipe_json, stored_archive_json):
     if not n_clicks or not stored_json:
-        return dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     df = pd.read_json(io.StringIO(stored_json), orient="split")
     written = upsert_repair_rates(df)
@@ -607,12 +621,23 @@ def confirm_import(n_clicks, stored_json, stored_pipe_json):
         pipe_df = pd.read_json(io.StringIO(stored_pipe_json), orient="split")
         pipe_written = upsert_pipe_repair_details(pipe_df)
 
+    archive_written = 0
+    if stored_archive_json:
+        try:
+            archive_df = pd.read_json(io.StringIO(stored_archive_json), orient="split")
+            archive_written = upsert_historical_baselines(archive_df)
+        except Exception:
+            pass  # best-effort; completed-project archive totals just won't be refreshed
+
     message = f"✅ {written} rows saved to the database."
     if pipe_written:
         message += f" ({pipe_written} pipe-level rows saved.)"
+    if archive_written:
+        message += f" ({archive_written} completed-project archive totals refreshed.)"
 
     return (
         html.Div(message, className="success-text"),
+        None,
         None,
         None,
     )
@@ -773,7 +798,10 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     summary_cards = html.Div(
         [
             _summary_card("Last Report Date", latest_date.strftime("%d.%m.%Y")),
-            _summary_card("Active Project Count", str(latest_df["project_no"].nunique())),
+            _summary_card(
+                "Active Project Count",
+                str((latest_df["project_status"] == "In Progress").sum()),
+            ),
             _summary_card("Overall Repair Rate", f"%{current_overall_ratio * 100:.2f}"),
         ],
         className="summary-cards",
