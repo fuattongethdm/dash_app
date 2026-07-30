@@ -20,6 +20,15 @@ LEGACY_BASELINE_ASSIGNMENTS = {
 }
 
 
+def _infer_production_type(project_no: object) -> str:
+    """Same naming convention the daily-table parser uses (parser._production_type):
+    project numbers for plate jobs carry "(PT)" or "Plate" in the name."""
+    lowered = str(project_no).lower()
+    if "(pt)" in lowered or "plate" in lowered:
+        return "Plate"
+    return "Coil"
+
+
 def enrich_historical_baseline_metadata(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
@@ -41,7 +50,9 @@ def enrich_historical_baseline_metadata(df: pd.DataFrame) -> pd.DataFrame:
             out.loc[mask, "include_in_dashboard"] = assignment["include_in_dashboard"]
 
     out["reporting_year"] = pd.to_numeric(out["reporting_year"], errors="coerce").fillna(2026).astype(int)
-    out["production_type"] = out["production_type"].fillna("Coil").astype(str).str.strip().replace("", "Coil")
+    missing_type = out["production_type"].isna() | out["production_type"].astype(str).str.strip().eq("")
+    out.loc[missing_type, "production_type"] = normalized_projects[missing_type].map(_infer_production_type)
+    out["production_type"] = out["production_type"].astype(str).str.strip()
     out["include_in_dashboard"] = out["include_in_dashboard"].fillna(True).astype(bool)
     return out
 
