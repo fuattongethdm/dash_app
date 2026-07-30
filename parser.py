@@ -7,6 +7,7 @@ from datetime import date
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
 
 from validators import (
     ValidationReport,
@@ -216,17 +217,28 @@ def parse_repair_rate_archive(file: str | Path | BinaryIO) -> pd.DataFrame:
     ws = wb[sheet_name]
 
     section = ARCHIVE_CURRENT_YEAR_SECTION
+    col_index = {key: column_index_from_string(letter) for key, letter in ARCHIVE_COLUMN_MAP.items()}
+
+    # Single sequential pass instead of per-cell bracket access — random
+    # cell access on a read_only worksheet re-scans from the start of the
+    # sheet on every call, which is what made the pipe-level parser take
+    # 73s before it was switched to this same pattern (see project_parser.py).
+    grid: dict[tuple[int, int], object] = {}
+    rows_iter = ws.iter_rows(min_row=section["start_row"], max_row=section["end_row"], values_only=True)
+    for row_idx, row in enumerate(rows_iter, start=section["start_row"]):
+        for col_idx, value in enumerate(row, start=1):
+            if value is not None:
+                grid[(row_idx, col_idx)] = value
+
     rows: list[dict[str, object]] = []
     for excel_row in range(section["start_row"], section["end_row"] + 1):
-        project_no = normalize_spaces(ws[f"{ARCHIVE_COLUMN_MAP['project_no']}{excel_row}"].value)
+        project_no = normalize_spaces(grid.get((excel_row, col_index["project_no"])))
         if not project_no:
             continue
 
-        spiral_length = coerce_number(ws[f"{ARCHIVE_COLUMN_MAP['repaired_spiral_length']}{excel_row}"].value)
-        repair_amount = coerce_number(ws[f"{ARCHIVE_COLUMN_MAP['total_repair_amount']}{excel_row}"].value)
-        repair_amount_incl_skelp = coerce_number(
-            ws[f"{ARCHIVE_COLUMN_MAP['total_repair_amount_incl_skelp']}{excel_row}"].value
-        )
+        spiral_length = coerce_number(grid.get((excel_row, col_index["repaired_spiral_length"])))
+        repair_amount = coerce_number(grid.get((excel_row, col_index["total_repair_amount"])))
+        repair_amount_incl_skelp = coerce_number(grid.get((excel_row, col_index["total_repair_amount_incl_skelp"])))
         if spiral_length is None or repair_amount is None:
             continue
 
