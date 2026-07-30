@@ -26,7 +26,12 @@ import pandas as pd
 
 _YEAR_PREFIX_RE = re.compile(r"^\d{4}Q-")
 _CORE_RE = re.compile(r"^(\d{1,2}-\d{2,3})")
-_TOKEN_RE = re.compile(r"[A-Za-z0-9\.]+")
+# Numbers and letter-runs as separate tokens — NOT [A-Za-z0-9\.]+, which would
+# glue "84x0.75" into one token that can never intersect the dimension
+# string's own tokens {"84", "x", "0.75"}, silently disabling token-overlap
+# matching for exactly the sheets that most need it (diameter+thickness
+# packed into the sheet name with no separator).
+_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[A-Za-z]+")
 _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
 _SUFFIX_CODES = {"jt", "sn", "nn", "rz", "ts", "je"}
 
@@ -130,6 +135,11 @@ def _resolve_candidate(
     tiers = [
         lambda s: bool(s["tokens"] & row_tokens),
         lambda s: s["diameter"] == diameter and s["thickness"] == thickness,
+        # No sheet claims this exact thickness — if exactly one sheet for
+        # this diameter has no thickness in its name at all (a generic
+        # "(84)" bucket, as opposed to a specific "(84x0.75)" one), that's
+        # the best default rather than refusing to match at all.
+        lambda s: s["diameter"] == diameter and s["thickness"] is None,
         lambda s: s["diameter"] == diameter and s["combined"] == combined,
         lambda s: s["diameter"] == diameter,
     ]
