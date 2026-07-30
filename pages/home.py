@@ -22,6 +22,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dash_table, dcc, html
+from openpyxl import load_workbook
 from dash.dash_table.Format import Format, Scheme
 
 from baseline import baseline_template_csv, parse_historical_baseline_csv
@@ -46,7 +47,8 @@ from database import (
 from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
-from project_parser import parse_project_pipe_repairs
+from project_matching import match_project_sheets
+from project_parser import NON_PROJECT_SHEETS, parse_project_pipe_repairs
 from validators import mark_duplicate_counts
 
 dash.register_page(__name__, path="/", name="Dashboard")
@@ -556,23 +558,55 @@ def handle_upload(contents, filename):
         style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
-    pipe_summary = None
+    summary_lines = []
     pipe_data_json = None
     try:
         pipe_file_obj = _decode_upload(contents)
         pipe_df, pipe_report = parse_project_pipe_repairs(pipe_file_obj, df["date"].iloc[0])
         if not pipe_df.empty:
-            pipe_summary = html.P(
-                f"Pipe-level: {pipe_report.parsed_rows} rows parsed from "
-                f"{pipe_report.parsed_sheets} project sheets.",
-                className="help-text",
+            summary_lines.append(
+                html.P(
+                    f"Pipe-level: {pipe_report.parsed_rows} rows parsed from "
+                    f"{pipe_report.parsed_sheets} project sheets.",
+                    className="help-text",
+                )
             )
             pipe_data_json = pipe_df.to_json(date_format="iso", orient="split")
     except Exception as exc:  # pipe-level parsing is best-effort, never blocks the main import
-        pipe_summary = html.P(
-            f"Pipe-level parsing failed (main import is unaffected): {exc}",
-            className="help-text",
+        summary_lines.append(
+            html.P(
+                f"Pipe-level parsing failed (main import is unaffected): {exc}",
+                className="help-text",
+            )
         )
+
+    try:
+        sheet_file_obj = _decode_upload(contents)
+        workbook = load_workbook(sheet_file_obj, read_only=True)
+        project_sheets = [name for name in workbook.sheetnames if name not in NON_PROJECT_SHEETS]
+        _, match_report = match_project_sheets(df, project_sheets)
+        if match_report.unmatched_rows:
+            unmatched_desc = ", ".join(
+                f"{u['project_no']} ({u['dimensions']})" for u in match_report.unmatched
+            )
+            summary_lines.append(
+                html.P(
+                    f"Project sheet matching: {match_report.matched_rows}/{len(df)} rows linked to a "
+                    f"project sheet. Unmatched: {unmatched_desc}.",
+                    className="help-text",
+                )
+            )
+        else:
+            summary_lines.append(
+                html.P(
+                    f"Project sheet matching: all {match_report.matched_rows} rows linked to a project sheet.",
+                    className="help-text",
+                )
+            )
+    except Exception:
+        pass  # best-effort; sheet-matching is purely informational
+
+    pipe_summary = html.Div(summary_lines) if summary_lines else None
 
     archive_data_json = None
     try:

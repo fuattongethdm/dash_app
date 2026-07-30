@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import BinaryIO
 from datetime import date
@@ -95,6 +96,18 @@ def _is_new_format(ws) -> bool:
     return True
 
 
+# Some rows have the dimension typed into the project number by mistake,
+# e.g. "12-112 (54 x 1.2)" where the dimensions column already separately
+# holds "Ø54"x1.2"". Strip that redundant suffix so project_no stays a
+# stable identifier — legitimate text qualifiers like "(PT)"/"(HDD)" don't
+# match this (numeric-only) pattern and are left alone.
+_BAKED_IN_DIMENSION_RE = re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?\s*\)\s*$", re.IGNORECASE)
+
+
+def _clean_project_no(project_no: str) -> str:
+    return _BAKED_IN_DIMENSION_RE.sub("", project_no).strip()
+
+
 def _production_type(default_type: str, project_no: str) -> str:
     lowered = project_no.lower()
     if "(pt)" in lowered or "plate" in lowered:
@@ -132,7 +145,7 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
     rows: list[dict[str, object]] = []
     for section in sections:
         for excel_row in range(section["start_row"], section["end_row"] + 1):
-            project_no = normalize_spaces(ws[f"{COLUMN_MAP['project_no']}{excel_row}"].value)
+            project_no = _clean_project_no(normalize_spaces(ws[f"{COLUMN_MAP['project_no']}{excel_row}"].value))
             dimensions = normalize_spaces(ws[f"{COLUMN_MAP['dimensions']}{excel_row}"].value)
 
             if not project_no or not dimensions:
