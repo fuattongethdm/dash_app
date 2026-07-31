@@ -1,8 +1,8 @@
 """
-Module 2: Data Conversion — bulk-upload coil cert PDFs (SDI) and merge the
-extracted fields into a single "Report"-formatted Excel matching the
-Excel-supplier's own layout (see pdf_cert_parser.py for the field mapping
-and column order rationale).
+Module 2: Data Conversion — bulk-upload coil certs, PDF (SDI) or Excel
+(JSW), and merge the extracted fields into a single "Report"-formatted
+Excel matching the Excel-supplier's own layout (see pdf_cert_parser.py for
+the field mapping and column order rationale).
 
 Stateless by design: nothing here is written to the database. Parsed rows
 accumulate in a dcc.Store for the current browser session only, and get
@@ -17,6 +17,7 @@ import io
 import dash
 from dash import Input, Output, State, callback, dash_table, dcc, html
 
+from excel_cert_parser import parse_jsw_cert_excel
 from pdf_cert_parser import REPORT_COLUMNS, build_report_rows, build_report_workbook, parse_sdi_cert_pdf
 
 dash.register_page(__name__, path="/data-conversion", name="Data Conversion")
@@ -44,8 +45,8 @@ def layout():
                 [
                     html.H2("Coil Certs → Common Excel"),
                     html.P(
-                        "Bulk-upload SDI coil cert PDFs. Extracted fields are merged into one "
-                        "Excel matching the Excel-supplier's report format.",
+                        "Bulk-upload coil certs — PDF (SDI) or Excel (JSW). Extracted fields are "
+                        "merged into one Excel, grouped by Heat No.",
                         className="help-text",
                     ),
                     html.Div(
@@ -57,7 +58,7 @@ def layout():
                                         id="cert-source-selector",
                                         options=[
                                             {"label": "PDF (SDI)", "value": "pdf"},
-                                            {"label": "Excel (Supplier) — coming soon", "value": "excel", "disabled": True},
+                                            {"label": "Excel (JSW)", "value": "excel"},
                                         ],
                                         value="pdf",
                                         inline=True,
@@ -70,7 +71,7 @@ def layout():
                     ),
                     dcc.Upload(
                         id="pdf-cert-upload",
-                        children=html.Div(["Drag and drop PDF certs here or ", html.A("select files")]),
+                        children=html.Div(["Drag and drop cert files here or ", html.A("select files")]),
                         className="upload-box",
                         multiple=True,
                     ),
@@ -103,9 +104,10 @@ def layout():
     Input("pdf-cert-clear-btn", "n_clicks"),
     State("pdf-cert-upload", "filename"),
     State("pdf-cert-store", "data"),
+    State("cert-source-selector", "value"),
     prevent_initial_call=True,
 )
-def handle_pdf_upload(contents_list, _clear_clicks, filenames, stored_rows):
+def handle_pdf_upload(contents_list, _clear_clicks, filenames, stored_rows, source):
     triggered = dash.ctx.triggered_id
     if triggered == "pdf-cert-clear-btn":
         return [], None
@@ -118,23 +120,27 @@ def handle_pdf_upload(contents_list, _clear_clicks, filenames, stored_rows):
     for contents, filename in zip(contents_list, filenames):
         try:
             file_obj = _decode_upload(contents)
-            result = parse_sdi_cert_pdf(file_obj, source_file=filename)
-        except Exception as exc:  # a single bad PDF shouldn't block the rest of the batch
+            if source == "excel":
+                results = parse_jsw_cert_excel(file_obj, source_file=filename)
+            else:
+                results = [parse_sdi_cert_pdf(file_obj, source_file=filename)]
+        except Exception as exc:  # a single bad file shouldn't block the rest of the batch
             status_lines.append(html.P(f"{filename}: failed to read ({exc})", className="help-text"))
             continue
 
-        stored_rows.append({"source_file": result.source_file, "fields": result.fields, "errors": result.errors})
-        if result.errors:
-            status_lines.append(
-                html.P(f"{filename}: {', '.join(result.errors)}", className="help-text")
+        file_errors = 0
+        for result in results:
+            stored_rows.append(
+                {"source_file": result.source_file, "fields": result.fields, "errors": result.errors}
             )
-        else:
+            if result.errors:
+                file_errors += 1
+                status_lines.append(html.P(f"{result.source_file}: {', '.join(result.errors)}", className="help-text"))
+
+        ok_count = len(results) - file_errors
+        if ok_count:
             status_lines.append(
-                html.P(
-                    f"{filename}: OK — Heat {result.fields.get('heat_no')}, "
-                    f"Coil {result.fields.get('coil_number')}",
-                    className="help-text",
-                )
+                html.P(f"{filename}: {ok_count} row(s) parsed OK.", className="help-text")
             )
 
     return stored_rows, html.Div(status_lines)
@@ -151,7 +157,7 @@ def handle_pdf_upload(contents_list, _clear_clicks, filenames, stored_rows):
 )
 def render_pdf_cert_preview(stored_rows):
     if not stored_rows:
-        return html.Div("No PDFs uploaded yet.", className="empty-state")
+        return html.Div("No certs uploaded yet.", className="empty-state")
 
     from pdf_cert_parser import PdfCertResult
 
@@ -163,8 +169,8 @@ def render_pdf_cert_preview(stored_rows):
     error_count = sum(1 for r in results if r.errors)
 
     summary = html.P(
-        f"{len(results)} PDF(s) uploaded, {len(df)} heat(s) after grouping."
-        + (f" {error_count} file(s) had missing fields — see messages above." if error_count else ""),
+        f"{len(results)} coil row(s) parsed, {len(df)} heat(s) after grouping."
+        + (f" {error_count} row(s) had missing fields — see messages above." if error_count else ""),
         className="help-text",
     )
 
