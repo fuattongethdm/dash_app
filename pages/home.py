@@ -29,6 +29,7 @@ from calculations import (
     METERS_PER_FOOT,
     apply_meter_based_repair_ratios,
     daily_weighted_repair_ratios,
+    daily_weighted_repair_ratios_for_dimension,
     daily_weighted_repair_ratios_for_type,
     repair_amount_trend_data,
 )
@@ -813,16 +814,26 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         className="summary-cards",
     )
 
-    # --- Trend chart: overall repair rate over time ---
+    # --- Trend chart: overall repair rate over time (excl. vs incl. skelp) ---
     trend_fig = go.Figure()
     trend_fig.add_trace(
         go.Scatter(
             x=overall_ratio["date"],
             y=overall_ratio["weighted_repair_ratio"] * 100,
             mode="lines+markers",
-            name="Repair Rate (%)",
+            name="Excl. Skelp",
             line=dict(color=COLOR_COIL, width=3),
-            hovertemplate="%{x|%d.%m.%Y}<br>Repair Rate: <b>%{y:.2f}%</b><extra></extra>",
+            hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
+    trend_fig.add_trace(
+        go.Scatter(
+            x=overall_ratio["date"],
+            y=overall_ratio["weighted_repair_ratio_incl_skelp"] * 100,
+            mode="lines+markers",
+            name="Incl. Skelp",
+            line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+            hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     trend_fig.update_layout(
@@ -1210,9 +1221,19 @@ def render_project_trend(selected_project):
             x=project_df["date"],
             y=project_df["repair_ratio"] * 100,
             mode="lines+markers",
-            name="Repair Ratio (%)",
+            name="Excl. Skelp",
             line=dict(color=COLOR_COIL, width=3),
-            hovertemplate="%{x|%d.%m.%Y}<br>Repair Ratio: <b>%{y:.2f}%</b><extra></extra>",
+            hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=project_df["date"],
+            y=project_df["repair_ratio_incl_skelp"] * 100,
+            mode="lines+markers",
+            name="Incl. Skelp",
+            line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+            hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     fig.update_layout(
@@ -1446,6 +1467,38 @@ def render_dimension_detail(selected_dimension):
     if dim_df.empty:
         return _empty_state("No projects found for this dimension on the latest day.")
 
+    dim_trend = daily_weighted_repair_ratios_for_dimension(master_df, selected_dimension)
+    trend_fig = go.Figure()
+    trend_fig.add_trace(
+        go.Scatter(
+            x=dim_trend["date"],
+            y=dim_trend["weighted_repair_ratio"] * 100,
+            mode="lines+markers",
+            name="Excl. Skelp",
+            line=dict(color=COLOR_COIL, width=3),
+            hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
+    trend_fig.add_trace(
+        go.Scatter(
+            x=dim_trend["date"],
+            y=dim_trend["weighted_repair_ratio_incl_skelp"] * 100,
+            mode="lines+markers",
+            name="Incl. Skelp",
+            line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+            hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
+    trend_fig.update_layout(
+        title=f"Repair Rate Trend — Dimension {selected_dimension}",
+        yaxis_title="Repair Rate (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+    )
+    trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
     fig = px.bar(
         dim_df,
         x="project_no",
@@ -1473,4 +1526,4 @@ def render_dimension_detail(selected_dimension):
         style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
-    return html.Div([dcc.Graph(figure=fig), table])
+    return html.Div([dcc.Graph(figure=trend_fig), dcc.Graph(figure=fig), table])

@@ -93,6 +93,15 @@ def daily_weighted_repair_ratios_for_type(
     return daily_weighted_repair_ratios(type_data, type_baseline)
 
 
+def daily_weighted_repair_ratios_for_dimension(df: pd.DataFrame, dimensions: str) -> pd.DataFrame:
+    """Same as daily_weighted_repair_ratios_for_type, but scoped to a single
+    dimension instead of a production type. No baseline carryover here —
+    archived/historical-baseline rows don't carry a real dimension value,
+    so they can't be meaningfully scoped to one."""
+    dim_data = df[df["dimensions"].astype(str).eq(str(dimensions))].copy()
+    return daily_weighted_repair_ratios(dim_data, None)
+
+
 def repair_amount_trend_data(df: pd.DataFrame, display_unit: str) -> pd.DataFrame:
     """Build repair amount trend data with non-negative daily increments.
 
