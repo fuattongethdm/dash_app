@@ -1014,6 +1014,16 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
+    type_trend_fig.add_trace(
+        go.Scatter(
+            x=overall_ratio["date"],
+            y=overall_ratio["weighted_repair_ratio"] * 100,
+            mode="lines+markers",
+            name="Mix (Coil + Plate)",
+            line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
+            hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
     type_trend_fig.update_layout(
         title="Repair Rate Trend by Production Type",
         yaxis_title="Repair Rate (%)",
