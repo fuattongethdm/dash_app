@@ -25,9 +25,9 @@ from calculations import (
     repair_amount_trend_data,
 )
 
-_ACCENT = "#2563eb"
-_GRID = "#e2e8f0"
-_ROW_ALT = "#f4f6f8"
+_ACCENT = "#2452d9"
+_GRID = "#d7deec"
+_ROW_ALT = "#e4e9f4"
 
 # A3 landscape usable width with 1.5cm margins on each side.
 _PAGE_MARGIN = 1.5 * cm
@@ -161,7 +161,7 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("ReportTitle", parent=styles["Title"], fontSize=20, spaceAfter=4)
-    subtitle_style = ParagraphStyle("ReportSubtitle", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#64748b"))
+    subtitle_style = ParagraphStyle("ReportSubtitle", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#5c6579"))
 
     # Trend + Amount charts side by side, sharing the full page width.
     charts_row = Table(

@@ -93,29 +93,29 @@ PERCENT_FORMAT = Format(scheme=Scheme.percentage, precision=2)
 NUMERIC_FORMAT = Format(scheme=Scheme.fixed, precision=2)
 
 TABLE_HEADER_STYLE = {
-    "backgroundColor": "#f4f6f8",
+    "backgroundColor": "#e4e9f4",
     "fontWeight": "700",
     "color": "var(--color-text)",
-    "borderBottom": "2px solid #cbd5e1",
+    "borderBottom": "2px solid #b9c3da",
     "textAlign": "left",
 }
 TABLE_CELL_STYLE = {"fontFamily": "inherit", "fontSize": "13px", "padding": "8px 10px"}
-TABLE_CONDITIONAL_STYLE = [{"if": {"row_index": "odd"}, "backgroundColor": "#f8fafc"}]
+TABLE_CONDITIONAL_STYLE = [{"if": {"row_index": "odd"}, "backgroundColor": "#e4e9f4"}]
 
 # Consistent hover-box styling across all charts: white background with a
 # light border, instead of Plotly's default (a box the same color as the
 # trace, which is hard to read against a same-colored bar/line).
 HOVER_STYLE = dict(
     bgcolor="white",
-    bordercolor="#e2e8f0",
-    font=dict(size=12, family="Inter, Segoe UI, system-ui, sans-serif", color="#1e293b"),
+    bordercolor="#d7deec",
+    font=dict(size=12, family="SF Mono, Roboto Mono, Consolas, monospace", color="#131a2b"),
 )
 
 # One consistent meaning per color across the whole dashboard.
-COLOR_COIL = "#2563eb"
-COLOR_PLATE = "#7c3aed"
-COLOR_SECONDARY = "#f97316"
-COLOR_MUTED = "#94a3b8"
+COLOR_COIL = "#2452d9"
+COLOR_PLATE = "#7c4fe0"
+COLOR_SECONDARY = "#c97a1f"
+COLOR_MUTED = "#8b93a8"
 
 
 TEXT_COLUMNS = {
@@ -168,15 +168,15 @@ def _table_records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
 _TAB_STYLE = {
     "padding": "12px 20px",
     "fontWeight": "600",
-    "color": "#64748b",
+    "color": "#5c6579",
     "border": "none",
     "borderBottom": "3px solid transparent",
-    "backgroundColor": "#f4f6f8",
+    "backgroundColor": "#e4e9f4",
 }
 _TAB_SELECTED_STYLE = {
     **_TAB_STYLE,
-    "color": "#2563eb",
-    "borderBottom": "3px solid #2563eb",
+    "color": "#2452d9",
+    "borderBottom": "3px solid #2452d9",
     "backgroundColor": "#ffffff",
 }
 
@@ -191,7 +191,7 @@ def layout():
             dcc.Tabs(
                 id="dashboard-tabs",
                 value="tab-dashboard",
-                style={"borderBottom": "1px solid #e2e8f0"},
+                style={"borderBottom": "1px solid #d7deec"},
                 children=[
                     dcc.Tab(
                         label="Import",

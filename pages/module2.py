@@ -23,13 +23,13 @@ from pdf_cert_parser import REPORT_COLUMNS, build_report_rows, build_report_work
 dash.register_page(__name__, path="/data-conversion", name="Data Conversion")
 
 TABLE_HEADER_STYLE = {
-    "backgroundColor": "#f4f6f8",
+    "backgroundColor": "#e4e9f4",
     "fontWeight": "600",
     "border": "none",
-    "borderBottom": "2px solid #e2e8f0",
+    "borderBottom": "2px solid #b9c3da",
 }
 TABLE_CELL_STYLE = {"fontFamily": "inherit", "fontSize": "13px", "padding": "8px 10px"}
-TABLE_CONDITIONAL_STYLE = [{"if": {"row_index": "odd"}, "backgroundColor": "#f8fafc"}]
+TABLE_CONDITIONAL_STYLE = [{"if": {"row_index": "odd"}, "backgroundColor": "#e4e9f4"}]
 
 
 def _decode_upload(contents: str) -> io.BytesIO:
