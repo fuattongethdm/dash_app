@@ -251,7 +251,7 @@ def build_report_workbook(df: pd.DataFrame) -> bytes:
 
     ws.merge_cells("A3:C3")
     ws["A3"] = "Part Information"
-    ws.merge_cells("D3:U3")
+    ws.merge_cells("D3:T3")
     ws["D3"] = "Elements"
     ws.merge_cells("V3:AB3")
     ws["V3"] = "Mechanical Properties"
