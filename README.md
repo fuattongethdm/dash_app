@@ -26,7 +26,7 @@ Then open `http://localhost:8050` in your browser.
 ```
 app.py              -> Entry point, page routing
 pages/
-  home.py            -> Module 1: Excel upload -> Dashboard (DONE)
+  home.py            -> Module 1: Excel upload -> Dashboard (procesing)
   module2.py          -> Module 2: placeholder (not yet built)
   module3.py          -> Module 3: placeholder (not yet built)
 assets/style.css      -> All visual styling lives here (Dash auto-loads it)

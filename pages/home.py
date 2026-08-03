@@ -18,6 +18,7 @@ import base64
 import io
 
 import dash
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -312,13 +313,31 @@ def layout():
                                 [
                                     html.H2("Project Trend"),
                                     html.P(
-                                        "Select a project to see its repair ratio over all report dates.",
+                                        "Select a project + dimensions to see its repair ratio over all report dates.",
                                         className="help-text",
                                     ),
                                     html.Div(
                                         [
                                             html.Div(
-                                                [html.Label("Project"), dcc.Dropdown(id="project-trend-dropdown")],
+                                                [
+                                                    html.Label("Project (Dimensions)"),
+                                                    dcc.Dropdown(id="project-trend-dropdown"),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label("Series"),
+                                                    dcc.Checklist(
+                                                        id="project-trend-checklist",
+                                                        options=[
+                                                            {"label": "Excl. Skelp", "value": "Excl"},
+                                                            {"label": "Incl. Skelp", "value": "Incl"},
+                                                        ],
+                                                        value=["Excl", "Incl"],
+                                                        inline=True,
+                                                    ),
+                                                ],
                                                 className="filter-field",
                                             ),
                                         ],
@@ -814,38 +833,6 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         className="summary-cards",
     )
 
-    # --- Trend chart: overall repair rate over time (excl. vs incl. skelp) ---
-    trend_fig = go.Figure()
-    trend_fig.add_trace(
-        go.Scatter(
-            x=overall_ratio["date"],
-            y=overall_ratio["weighted_repair_ratio"] * 100,
-            mode="lines+markers",
-            name="Excl. Skelp",
-            line=dict(color=COLOR_COIL, width=3),
-            hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
-        )
-    )
-    trend_fig.add_trace(
-        go.Scatter(
-            x=overall_ratio["date"],
-            y=overall_ratio["weighted_repair_ratio_incl_skelp"] * 100,
-            mode="lines+markers",
-            name="Incl. Skelp",
-            line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-            hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
-        )
-    )
-    trend_fig.update_layout(
-        title="Overall Repair Rate Trend",
-        yaxis_title="Repair Rate (%)",
-        xaxis_title="Date",
-        template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
-        hoverlabel=HOVER_STYLE,
-    )
-    trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
-
     # --- Daily repair amount (bar) ---
     daily_amount = repair_amount_trend_data(master_df, display_unit="m")
     bar_fig = px.bar(
@@ -886,7 +873,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
 
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
     skelp_df = latest_df[["project_label", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
-    skelp_df["skelp_impact"] = skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]
+    skelp_df["skelp_impact"] = (skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]).round(6)
     skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
@@ -919,7 +906,54 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     skelp_fig.update_xaxes(tickangle=-45)
     skelp_fig.update_yaxes(tickformat=".0%")
 
-    # --- Repair amount by dimension ---
+    # --- Skelp impact: same as above, but on the repair amount (m) itself
+    # rather than the ratio. Locked to the same top-10 projects (ranked by
+    # ratio impact, from the chart above) instead of picking its own top 10
+    # by amount — otherwise the two side-by-side charts show different
+    # projects and can't be compared directly.
+    skelp_amount_df = latest_df[["project_label", "total_repair_amount", "total_repair_amount_incl_skelp"]].copy()
+    skelp_amount_df["skelp_impact_amount"] = (
+        skelp_amount_df["total_repair_amount_incl_skelp"] - skelp_amount_df["total_repair_amount"]
+    ).round(4)
+    skelp_amount_top = skelp_top[["project_label"]].merge(skelp_amount_df, on="project_label", how="left")
+    skelp_amount_top["pct_increase"] = (
+        skelp_amount_top["skelp_impact_amount"]
+        / skelp_amount_top["total_repair_amount"].where(skelp_amount_top["total_repair_amount"] != 0)
+    ).fillna(0) * 100
+    skelp_amount_fig = go.Figure()
+    skelp_amount_fig.add_trace(
+        go.Bar(
+            x=skelp_amount_top["project_label"],
+            y=skelp_amount_top["total_repair_amount"],
+            name="Repair Amount (m)",
+            marker_color=COLOR_COIL,
+            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+        )
+    )
+    skelp_amount_fig.add_trace(
+        go.Bar(
+            x=skelp_amount_top["project_label"],
+            y=skelp_amount_top["skelp_impact_amount"],
+            name="Skelp Impact (m)",
+            marker_color=COLOR_SECONDARY,
+            customdata=skelp_amount_top["pct_increase"],
+            hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2f} m</b> (+%{customdata:.1f}%)<extra></extra>",
+        )
+    )
+    skelp_amount_fig.update_layout(
+        barmode="stack",
+        title="Skelp Impact on Repair Amount (Same Top 10 as Ratio Impact)",
+        yaxis_title="Repair Amount (m)",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=80),
+        hoverlabel=HOVER_STYLE,
+        xaxis=dict(categoryorder="array", categoryarray=skelp_amount_top["project_label"].tolist()),
+    )
+    skelp_amount_fig.update_xaxes(tickangle=-45)
+
+    # --- Repair amount by dimension (data only — still feeds the weighted-
+    # ratio-by-dimension chart below; its own chart slot now shows the
+    # skelp-impact-on-amount chart above instead) ---
     dimension_df = (
         latest_df.groupby("dimensions", as_index=False)
         .agg(
@@ -930,19 +964,6 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
         .sort_values("total_repair_amount", ascending=False)
         .head(15)
     )
-    dimension_fig = px.bar(
-        dimension_df,
-        x="dimensions",
-        y="total_repair_amount",
-        labels={"dimensions": "Dimensions", "total_repair_amount": "Total Repair Amount (m)"},
-        title="Repair Amount by Dimension (Latest Day)",
-    )
-    dimension_fig.update_traces(
-        marker_color=COLOR_COIL,
-        hovertemplate="%{x}<br>Total Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
-    )
-    dimension_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
-    dimension_fig.update_xaxes(tickangle=-45)
 
     # --- Weighted repair ratio by dimension ---
     dimension_ratio_df = dimension_df.copy()
@@ -1008,42 +1029,91 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     pareto_fig.update_xaxes(tickangle=-45)
 
-    production_types = sorted(master_df["production_type"].dropna().unique())
-    _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
-
-    # --- Repair rate trend by production type ---
-    type_trend_fig = go.Figure()
-    for p_type in production_types:
-        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df)
-        type_trend_fig.add_trace(
-            go.Scatter(
-                x=type_trend["date"],
-                y=type_trend["weighted_repair_ratio"] * 100,
-                mode="lines+markers",
-                name=p_type,
-                line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
-                hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
-            )
-        )
-    type_trend_fig.add_trace(
-        go.Scatter(
-            x=overall_ratio["date"],
-            y=overall_ratio["weighted_repair_ratio"] * 100,
-            mode="lines+markers",
-            name="Mix (Coil + Plate)",
-            line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
-            hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
+    # --- Repair ratio pareto: same idea, but ranked by repair ratio instead
+    # of absolute amount, so a small pipe with a very high ratio still shows
+    # up as a top contributor even if its absolute meters are small ---
+    ratio_pareto_df = latest_df[["project_label", "repair_ratio"]].sort_values(
+        "repair_ratio", ascending=False
+    ).reset_index(drop=True)
+    ratio_pareto_df["cumulative_pct"] = (
+        ratio_pareto_df["repair_ratio"].cumsum() / ratio_pareto_df["repair_ratio"].sum() * 100
+    )
+    ratio_pareto_fig = go.Figure()
+    ratio_pareto_fig.add_trace(
+        go.Bar(
+            x=ratio_pareto_df["project_label"],
+            y=ratio_pareto_df["repair_ratio"],
+            name="Repair Ratio",
+            marker_color=COLOR_COIL,
+            hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
-    type_trend_fig.update_layout(
-        title="Repair Rate Trend by Production Type",
-        yaxis_title="Repair Rate (%)",
-        xaxis_title="Date",
+    ratio_pareto_fig.add_trace(
+        go.Scatter(
+            x=ratio_pareto_df["project_label"],
+            y=ratio_pareto_df["cumulative_pct"],
+            name="Cumulative %",
+            yaxis="y2",
+            line=dict(color=COLOR_SECONDARY, width=2),
+            mode="lines+markers",
+            hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
+        )
+    )
+    ratio_pareto_fig.update_layout(
+        title="Repair Ratio Pareto (Latest Day)",
+        template="plotly_white",
+        yaxis=dict(title="Repair Ratio", tickformat=".0%"),
+        yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
+        margin=dict(l=40, r=40, t=50, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hoverlabel=HOVER_STYLE,
+        xaxis=dict(categoryorder="array", categoryarray=ratio_pareto_df["project_label"].tolist()),
+    )
+    ratio_pareto_fig.update_xaxes(tickangle=-45)
+
+    # --- Production quality and volume matrix (bubble plot): volume (pipe
+    # length), quality (spiral repair ratio) and repair amount in one view ---
+    bubble_df = latest_df[["project_label", "project_total_pipe_length", "repair_ratio", "total_repair_amount"]].copy()
+    bubble_df["repair_ratio_pct"] = (bubble_df["repair_ratio"] * 100).round(4)
+    bubble_fig = go.Figure()
+    bubble_fig.add_trace(
+        go.Scatter(
+            x=bubble_df["project_total_pipe_length"],
+            y=bubble_df["repair_ratio_pct"],
+            mode="markers",
+            text=bubble_df["project_label"],
+            marker=dict(
+                size=bubble_df["total_repair_amount"],
+                sizemode="area",
+                sizeref=2.0 * bubble_df["total_repair_amount"].max() / (40.0**2),
+                sizemin=4,
+                color=bubble_df["repair_ratio_pct"],
+                colorscale="YlOrRd",
+                showscale=True,
+                colorbar=dict(title="Repair Ratio (%)"),
+                opacity=0.55,
+                line=dict(color="black", width=1.5),
+            ),
+            hovertemplate=(
+                "%{text}<br>"
+                "Total Pipe Length: <b>%{x:.1f} ft</b><br>"
+                "Spiral Repair Ratio: <b>%{y:.2f}%</b><br>"
+                "Total Repair Amount: <b>%{marker.size:.2f} mt</b>"
+                "<extra></extra>"
+            ),
+        )
+    )
+    bubble_fig.update_layout(
+        title="Repair Ratio vs. Production Volume by Project (Latest Day)",
+        xaxis_title="Total Production Pipe Length (ft)",
+        yaxis_title="Spiral Repair Ratio (%)",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    type_trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
+    production_types = sorted(master_df["production_type"].dropna().unique())
+    _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
 
     # --- Weighted repair ratio by production type (latest day) ---
     type_rows = []
@@ -1140,8 +1210,37 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             summary_cards,
             html.Div(
                 [
-                    dcc.Graph(figure=trend_fig, className="chart-half"),
-                    dcc.Graph(figure=bar_fig, className="chart-half"),
+                    html.Div(
+                        [
+                            dcc.Checklist(
+                                id="overall-trend-checklist",
+                                options=[
+                                    {"label": "Excl. Skelp", "value": "Excl"},
+                                    {"label": "Incl. Skelp", "value": "Incl"},
+                                ],
+                                value=["Excl", "Incl"],
+                                inline=True,
+                            ),
+                            dcc.Loading(html.Div(id="overall-trend-graph-content")),
+                        ],
+                        className="chart-half",
+                    ),
+                    html.Div(
+                        [
+                            dcc.Checklist(
+                                id="type-trend-checklist",
+                                options=[
+                                    {"label": "Coil", "value": "Coil"},
+                                    {"label": "Plate", "value": "Plate"},
+                                    {"label": "Mix (Coil + Plate)", "value": "Mix"},
+                                ],
+                                value=["Coil", "Plate", "Mix"],
+                                inline=True,
+                            ),
+                            dcc.Loading(html.Div(id="type-trend-graph-content")),
+                        ],
+                        className="chart-half",
+                    ),
                 ],
                 className="chart-row",
             ),
@@ -1149,13 +1248,15 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             html.Div(
                 [
                     dcc.Graph(figure=skelp_fig, className="chart-half"),
-                    dcc.Graph(figure=dimension_fig, className="chart-half"),
+                    dcc.Graph(figure=skelp_amount_fig, className="chart-half"),
                 ],
                 className="chart-row",
             ),
-            dcc.Graph(figure=dimension_ratio_fig),
+            dcc.Graph(figure=ratio_pareto_fig),
             dcc.Graph(figure=pareto_fig),
-            dcc.Graph(figure=type_trend_fig),
+            dcc.Graph(figure=bubble_fig),
+            dcc.Graph(figure=dimension_ratio_fig),
+            dcc.Graph(figure=bar_fig),
             html.Div(
                 [
                     dcc.Graph(figure=type_analysis_fig, className="chart-half"),
@@ -1177,6 +1278,189 @@ def _summary_card(label: str, value: str) -> html.Div:
     )
 
 
+def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repair_ratio"):
+    """Straight-line (least-squares) trend over at most the last 30 days of
+    ``series_df`` (date, ``value_col``). With less than 30 days of history —
+    all we have right now — this naturally covers the full range from the
+    first to the last available day."""
+    windowed = series_df.dropna(subset=["date", value_col]).sort_values("date")
+    if windowed.empty:
+        return None
+    window_start = windowed["date"].max() - pd.Timedelta(days=30)
+    windowed = windowed[windowed["date"] >= window_start]
+    if len(windowed) < 2:
+        return None
+
+    day_offsets = (windowed["date"] - windowed["date"].min()).dt.days
+    slope, intercept = np.polyfit(day_offsets, windowed[value_col] * 100, 1)
+    trend_y = (slope * day_offsets + intercept).round(4)
+    # Guard against floating-point noise (e.g. slope ~1e-16 on genuinely flat
+    # data) being reported as "Rising"/"Falling".
+    if slope > 1e-6:
+        direction = "Rising"
+    elif slope < -1e-6:
+        direction = "Falling"
+    else:
+        direction = "Flat"
+    return go.Scatter(
+        x=windowed["date"],
+        y=trend_y,
+        mode="lines",
+        name=f"Trend ({direction})",
+        line=dict(width=2, color=COLOR_MUTED, dash="dot"),
+        hovertemplate="%{x|%d.%m.%Y}<br>Trend: <b>%{y:.2f}%</b><extra></extra>",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback: Overall Repair Rate Trend — same idea as the production-type
+# trend below: a checklist isolates Excl./Incl. Skelp, and a linear trend
+# line is drawn (last 30 days, or the full range if shorter) when only one
+# of the two is selected.
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("overall-trend-graph-content", "children"),
+    Input("overall-trend-checklist", "value"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),
+    Input("baseline-import-confirm-result", "children"),
+)
+def render_overall_trend_chart(selected_series, _n_clicks, _import_result, _baseline_import_result):
+    master_df = load_master_data()
+    if master_df.empty or not selected_series:
+        return _empty_state("No data available. Import an Excel file first.")
+
+    baseline_df = load_historical_baselines()
+    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
+
+    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
+    overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
+    overall_ratio["weighted_repair_ratio_incl_skelp"] = overall_ratio["weighted_repair_ratio_incl_skelp"].round(6)
+
+    fig = go.Figure()
+    if "Excl" in selected_series:
+        fig.add_trace(
+            go.Scatter(
+                x=overall_ratio["date"],
+                y=overall_ratio["weighted_repair_ratio"] * 100,
+                mode="lines+markers",
+                name="Excl. Skelp",
+                line=dict(color=COLOR_COIL, width=3),
+                hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+            )
+        )
+    if "Incl" in selected_series:
+        fig.add_trace(
+            go.Scatter(
+                x=overall_ratio["date"],
+                y=overall_ratio["weighted_repair_ratio_incl_skelp"] * 100,
+                mode="lines+markers",
+                name="Incl. Skelp",
+                line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+                hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+            )
+        )
+
+    # Same rule as the production-type trend: only draw a trend line when a
+    # single series is isolated.
+    if len(selected_series) == 1:
+        value_col = "weighted_repair_ratio" if selected_series[0] == "Excl" else "weighted_repair_ratio_incl_skelp"
+        trend_trace = _build_trend_trace(overall_ratio, value_col)
+        if trend_trace is not None:
+            fig.add_trace(trend_trace)
+
+    fig.update_layout(
+        title="Overall Repair Rate Trend",
+        yaxis_title="Repair Rate (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+    )
+    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
+    return dcc.Graph(figure=fig)
+
+
+# ---------------------------------------------------------------------------
+# Callback: Repair Rate Trend by Production Type — redraw for the lines
+# selected in the checklist, so a small (e.g. 0.01%) change in one line isn't
+# masked by the other lines sharing the same y-axis.
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("type-trend-graph-content", "children"),
+    Input("type-trend-checklist", "value"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),
+    Input("baseline-import-confirm-result", "children"),
+)
+def render_type_trend_chart(selected_types, _n_clicks, _import_result, _baseline_import_result):
+    master_df = load_master_data()
+    if master_df.empty or not selected_types:
+        return _empty_state("No data available. Import an Excel file first.")
+
+    baseline_df = load_historical_baselines()
+    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
+
+    _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
+    series_by_type = {}
+    fig = go.Figure()
+    for p_type in ("Coil", "Plate"):
+        if p_type not in selected_types:
+            continue
+        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df).copy()
+        # Round away floating-point noise (e.g. 7.368510195727456 vs ...455)
+        # left over from the division chain — otherwise a genuinely flat
+        # series renders as a jittery line and throws off the trend fit.
+        type_trend["weighted_repair_ratio"] = type_trend["weighted_repair_ratio"].round(6)
+        series_by_type[p_type] = type_trend
+        fig.add_trace(
+            go.Scatter(
+                x=type_trend["date"],
+                y=type_trend["weighted_repair_ratio"] * 100,
+                mode="lines+markers",
+                name=p_type,
+                line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
+                hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
+            )
+        )
+    if "Mix" in selected_types:
+        overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
+        overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
+        series_by_type["Mix"] = overall_ratio
+        fig.add_trace(
+            go.Scatter(
+                x=overall_ratio["date"],
+                y=overall_ratio["weighted_repair_ratio"] * 100,
+                mode="lines+markers",
+                name="Mix (Coil + Plate)",
+                line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
+                hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
+            )
+        )
+
+    # A trend line only makes sense when a single series is isolated —
+    # overlaying it on top of 2-3 lines would add clutter, not remove it.
+    if len(selected_types) == 1:
+        trend_trace = _build_trend_trace(series_by_type[selected_types[0]])
+        if trend_trace is not None:
+            fig.add_trace(trend_trace)
+
+    fig.update_layout(
+        title="Repair Rate Trend by Production Type",
+        yaxis_title="Repair Rate (%)",
+        xaxis_title="Date",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+    )
+    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+
+    return dcc.Graph(figure=fig)
+
+
 # ---------------------------------------------------------------------------
 # Callback X1: Project Trend — populate the project dropdown
 # ---------------------------------------------------------------------------
@@ -1191,8 +1475,20 @@ def load_project_trend_options(_id, _import_result):
     master_df = load_master_data()
     if master_df.empty:
         return [], None
-    projects = sorted(master_df["project_no"].dropna().unique())
-    options = [{"label": p, "value": p} for p in projects]
+    # A project_no alone isn't unique — the same project can carry several
+    # dimensions (e.g. "2026Q-10-108JT" spans 7 different dimensions in the
+    # real data). Offer project + dimensions as one combined choice so the
+    # trend line below is never built from mismatched dimension rows.
+    combos = (
+        master_df[["project_no", "dimensions"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(["project_no", "dimensions"])
+    )
+    options = [
+        {"label": f"{row.project_no} ({row.dimensions})", "value": f"{row.project_no}||{row.dimensions}"}
+        for row in combos.itertuples(index=False)
+    ]
     return options, options[0]["value"] if options else None
 
 
@@ -1203,41 +1499,58 @@ def load_project_trend_options(_id, _import_result):
 @callback(
     Output("project-trend-content", "children"),
     Input("project-trend-dropdown", "value"),
+    Input("project-trend-checklist", "value"),
 )
-def render_project_trend(selected_project):
-    if not selected_project:
+def render_project_trend(selected_value, selected_series):
+    if not selected_value or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
 
+    project_no, _, dimensions = selected_value.partition("||")
     master_df = load_master_data()
-    project_df = master_df[master_df["project_no"] == selected_project].copy()
+    project_df = master_df[
+        (master_df["project_no"] == project_no) & (master_df["dimensions"] == dimensions)
+    ].copy()
     if project_df.empty:
         return _empty_state("No data available for this project.")
 
     project_df = apply_meter_based_repair_ratios(project_df).sort_values("date")
+    project_df["repair_ratio"] = project_df["repair_ratio"].round(6)
+    project_df["repair_ratio_incl_skelp"] = project_df["repair_ratio_incl_skelp"].round(6)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=project_df["date"],
-            y=project_df["repair_ratio"] * 100,
-            mode="lines+markers",
-            name="Excl. Skelp",
-            line=dict(color=COLOR_COIL, width=3),
-            hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+    if "Excl" in selected_series:
+        fig.add_trace(
+            go.Scatter(
+                x=project_df["date"],
+                y=project_df["repair_ratio"] * 100,
+                mode="lines+markers",
+                name="Excl. Skelp",
+                line=dict(color=COLOR_COIL, width=3),
+                hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+            )
         )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=project_df["date"],
-            y=project_df["repair_ratio_incl_skelp"] * 100,
-            mode="lines+markers",
-            name="Incl. Skelp",
-            line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-            hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+    if "Incl" in selected_series:
+        fig.add_trace(
+            go.Scatter(
+                x=project_df["date"],
+                y=project_df["repair_ratio_incl_skelp"] * 100,
+                mode="lines+markers",
+                name="Incl. Skelp",
+                line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+                hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+            )
         )
-    )
+
+    # Same rule as the other trend charts: only draw a trend line when a
+    # single series is isolated.
+    if len(selected_series) == 1:
+        value_col = "repair_ratio" if selected_series[0] == "Excl" else "repair_ratio_incl_skelp"
+        trend_trace = _build_trend_trace(project_df, value_col)
+        if trend_trace is not None:
+            fig.add_trace(trend_trace)
+
     fig.update_layout(
-        title=f"Repair Ratio Trend — {selected_project}",
+        title=f"Repair Ratio Trend — {project_no} ({dimensions})",
         yaxis_title="Repair Ratio (%)",
         xaxis_title="Date",
         template="plotly_white",
