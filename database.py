@@ -17,7 +17,6 @@ except ImportError:
 
 
 TABLE_NAME = "repair_rates"
-BASELINE_TABLE_NAME = "historical_baselines"
 PIPE_TABLE_NAME = "pipe_repair_details"
 PROJECT_GROUP_CONFIG_TABLE_NAME = "project_group_configs"
 DB_PATH = Path(os.getenv("REPAIR_DB_PATH", str(Path("data") / "daily_repair_rate.sqlite")))
@@ -40,19 +39,6 @@ CREATE TABLE IF NOT EXISTS repair_rates (
     repair_ratio REAL NOT NULL,
     repair_ratio_incl_skelp REAL NOT NULL,
     UNIQUE(date, project_no, dimensions)
-);
-"""
-
-BASELINE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS historical_baselines (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_no TEXT NOT NULL,
-    dimensions TEXT NOT NULL,
-    repaired_spiral_length REAL NOT NULL,
-    total_repair_amount REAL NOT NULL,
-    total_repair_amount_incl_skelp REAL NOT NULL,
-    project_status TEXT NOT NULL,
-    UNIQUE(project_no, dimensions)
 );
 """
 
@@ -110,21 +96,6 @@ ON CONFLICT(date, project_no, dimensions) DO UPDATE SET
     project_status = excluded.project_status,
     repair_ratio = excluded.repair_ratio,
     repair_ratio_incl_skelp = excluded.repair_ratio_incl_skelp;
-"""
-
-BASELINE_UPSERT_SQL = """
-INSERT INTO historical_baselines (
-    project_no, dimensions, repaired_spiral_length, total_repair_amount,
-    total_repair_amount_incl_skelp, project_status
-) VALUES (
-    :project_no, :dimensions, :repaired_spiral_length, :total_repair_amount,
-    :total_repair_amount_incl_skelp, :project_status
-)
-ON CONFLICT(project_no, dimensions) DO UPDATE SET
-    repaired_spiral_length = excluded.repaired_spiral_length,
-    total_repair_amount = excluded.total_repair_amount,
-    total_repair_amount_incl_skelp = excluded.total_repair_amount_incl_skelp,
-    project_status = excluded.project_status;
 """
 
 PIPE_UPSERT_SQL = """
@@ -234,7 +205,6 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     should_close = conn is None
     conn = conn or get_connection()
     conn.execute(SCHEMA)
-    conn.execute(BASELINE_SCHEMA)
     conn.execute(PIPE_SCHEMA)
     conn.execute(PROJECT_GROUP_CONFIG_SCHEMA)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(repair_rates)").fetchall()}
@@ -337,20 +307,6 @@ def _records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
     write_df["date"] = pd.to_datetime(write_df["date"]).dt.strftime("%Y-%m-%d")
     records = write_df.where(pd.notna(write_df), None).to_dict(orient="records")
     return records
-
-
-def _baseline_records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
-    write_df = df[
-        [
-            "project_no",
-            "dimensions",
-            "repaired_spiral_length",
-            "total_repair_amount",
-            "total_repair_amount_incl_skelp",
-            "project_status",
-        ]
-    ].copy()
-    return write_df.where(pd.notna(write_df), None).to_dict(orient="records")
 
 
 def _pipe_records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -534,43 +490,3 @@ def _normalize_pipe_repair_details(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def upsert_historical_baselines(df: pd.DataFrame, conn: sqlite3.Connection | None = None) -> int:
-    records = _baseline_records_from_df(df)
-
-    if get_backend_name() == "supabase":
-        client = _get_supabase_client()
-        _execute_with_retry(client.table(BASELINE_TABLE_NAME).upsert(records, on_conflict="project_no,dimensions"))
-        return len(records)
-
-    should_close = conn is None
-    conn = conn or get_connection()
-    init_db(conn)
-    conn.executemany(BASELINE_UPSERT_SQL, records)
-    conn.commit()
-    if should_close:
-        conn.close()
-    return len(records)
-
-
-def load_historical_baselines(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
-    if get_backend_name() == "supabase":
-        try:
-            rows = _fetch_supabase_table(BASELINE_TABLE_NAME, ("project_no", "dimensions"))
-        except Exception as exc:
-            if "historical_baselines" in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
-                return pd.DataFrame()
-            raise
-        df = pd.DataFrame(rows)
-        from baseline import enrich_historical_baseline_metadata
-
-        return enrich_historical_baseline_metadata(df)
-
-    should_close = conn is None
-    conn = conn or get_connection()
-    init_db(conn)
-    df = pd.read_sql_query("SELECT * FROM historical_baselines ORDER BY project_no, dimensions", conn)
-    if should_close:
-        conn.close()
-    from baseline import enrich_historical_baseline_metadata
-
-    return enrich_historical_baseline_metadata(df)

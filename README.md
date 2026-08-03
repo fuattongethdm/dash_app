@@ -34,7 +34,6 @@ parser.py             -> Excel-reading logic
 validators.py          -> Validation logic
 database.py            -> Supabase/SQLite database layer
 calculations.py         -> Repair rate calculations
-baseline.py             -> Historical baseline logic
 supabase_setup.sql      -> Supabase schema (run once in the SQL Editor)
 ```
 

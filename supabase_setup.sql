@@ -20,17 +20,6 @@ create table if not exists repair_rates (
     unique (date, project_no, dimensions)
 );
 
-create table if not exists historical_baselines (
-    id bigint generated always as identity primary key,
-    project_no text not null,
-    dimensions text not null,
-    repaired_spiral_length numeric not null,
-    total_repair_amount numeric not null,
-    total_repair_amount_incl_skelp numeric not null,
-    project_status text not null,
-    unique (project_no, dimensions)
-);
-
 create table if not exists pipe_repair_details (
     id bigint generated always as identity primary key,
     date date not null,
@@ -62,6 +51,5 @@ create table if not exists project_group_configs (
 -- so no extra policies are needed. Set SUPABASE_KEY in .env to the
 -- "service_role" secret key (not the anon/public key).
 alter table repair_rates enable row level security;
-alter table historical_baselines enable row level security;
 alter table pipe_repair_details enable row level security;
 alter table project_group_configs enable row level security;

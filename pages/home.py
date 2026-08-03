@@ -1,6 +1,6 @@
 """
-Dashboard page: daily Excel import, historical baseline import, the main
-dashboard, pipe-level drill-down, and project grouping — organized as tabs
+Dashboard page: daily Excel import, the main dashboard, pipe-level
+drill-down, and project grouping — organized as tabs
 so the page doesn't grow into one long endless scroll as more sections
 are added.
 
@@ -25,7 +25,6 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dash_table, dcc, html
 from dash.dash_table.Format import Format, Scheme
 
-from baseline import baseline_template_csv, parse_historical_baseline_csv
 from calculations import (
     METERS_PER_FOOT,
     apply_meter_based_repair_ratios,
@@ -36,16 +35,14 @@ from calculations import (
 )
 from database import (
     get_existing_keys,
-    load_historical_baselines,
     load_master_data,
     load_pipe_repair_details,
     load_project_group_config,
-    upsert_historical_baselines,
     upsert_pipe_repair_details,
     upsert_project_group_config,
     upsert_repair_rates,
 )
-from parser import parse_daily_repair_rate, parse_repair_rate_archive
+from parser import parse_daily_repair_rate
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
 from project_parser import parse_project_pipe_repairs
@@ -188,7 +185,6 @@ def layout():
             # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
             dcc.Store(id="parsed-pipe-data-store"),
-            dcc.Store(id="parsed-archive-baseline-store"),
             dcc.Tabs(
                 id="dashboard-tabs",
                 value="tab-dashboard",
@@ -228,48 +224,6 @@ def layout():
                                         style={"display": "none"},
                                     ),
                                     dcc.Loading(html.Div(id="import-confirm-result"), type="circle"),
-                                ],
-                                className="card",
-                            ),
-                            html.Section(
-                                [
-                                    html.H2("Historical Baseline"),
-                                    html.P(
-                                        "Upload a CSV to include the total repair amount of projects "
-                                        "carried over from previous years in the overall repair rate calculation.",
-                                        className="help-text",
-                                    ),
-                                    html.Button(
-                                        "Download Template CSV",
-                                        id="download-baseline-template-btn",
-                                        className="secondary-btn",
-                                    ),
-                                    dcc.Download(id="baseline-template-download"),
-                                    dcc.Store(id="parsed-baseline-store"),
-                                    dcc.Upload(
-                                        id="baseline-upload",
-                                        children=html.Div(
-                                            ["Drag and drop the CSV file here or ", html.A("select a file")]
-                                        ),
-                                        className="upload-box",
-                                        multiple=False,
-                                    ),
-                                    dcc.Loading(
-                                        html.Div(
-                                            [
-                                                html.Div(id="baseline-validation-result"),
-                                                html.Div(id="baseline-preview-table"),
-                                            ]
-                                        ),
-                                        type="circle",
-                                    ),
-                                    html.Button(
-                                        "Confirm Baseline Import",
-                                        id="confirm-baseline-import-btn",
-                                        className="primary-btn",
-                                        style={"display": "none"},
-                                    ),
-                                    dcc.Loading(html.Div(id="baseline-import-confirm-result"), type="circle"),
                                 ],
                                 className="card",
                             ),
@@ -506,21 +460,6 @@ def _empty_state(message: str) -> html.Div:
     return html.Div(message, className="empty-state")
 
 
-def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
-    if errors:
-        return html.Div(
-            [
-                html.H4(f"Errors ({len(errors)})", className="error-heading"),
-                html.Ul([html.Li(err) for err in errors], className="error-list"),
-            ],
-            className="validation-box fail",
-        )
-    return html.Div(
-        html.P(f"{row_count} rows read, no errors.", className="success-text"),
-        className="validation-box ok",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Callback 1: Upload Excel -> parse -> validate -> show preview
 # ---------------------------------------------------------------------------
@@ -532,14 +471,13 @@ def _baseline_validation_box(errors: list[str], row_count: int) -> html.Div:
     Output("confirm-import-btn", "style"),
     Output("parsed-data-store", "data"),
     Output("parsed-pipe-data-store", "data"),
-    Output("parsed-archive-baseline-store", "data"),
     Input("excel-upload", "contents"),
     State("excel-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if contents is None:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     try:
         file_obj = _decode_upload(contents)
@@ -549,7 +487,7 @@ def handle_upload(contents, filename):
             f"An unexpected error occurred while reading the file: {exc}",
             className="validation-box fail",
         )
-        return error_box, None, None, {"display": "none"}, None, None, None
+        return error_box, None, None, {"display": "none"}, None, None
 
     if not df.empty and report.ok:
         # Tell the user upfront whether this import will overwrite existing
@@ -563,7 +501,7 @@ def handle_upload(contents, filename):
     validation_box = _validation_summary(report)
 
     if df.empty or not report.ok:
-        return validation_box, None, None, {"display": "none"}, None, None, None
+        return validation_box, None, None, {"display": "none"}, None, None
 
     preview_columns = [c for c in df.columns if c != "excel_row"]
     preview = dash_table.DataTable(
@@ -600,15 +538,6 @@ def handle_upload(contents, filename):
 
     pipe_summary = html.Div(summary_lines) if summary_lines else None
 
-    archive_data_json = None
-    try:
-        archive_file_obj = _decode_upload(contents)
-        archive_df = parse_repair_rate_archive(archive_file_obj)
-        if not archive_df.empty:
-            archive_data_json = archive_df.to_json(orient="split")
-    except Exception:
-        pass  # best-effort; completed-project archive totals just won't be refreshed
-
     return (
         validation_box,
         html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
@@ -616,7 +545,6 @@ def handle_upload(contents, filename):
         {"display": "inline-block"},
         df.to_json(date_format="iso", orient="split"),
         pipe_data_json,
-        archive_data_json,
     )
 
 
@@ -628,16 +556,14 @@ def handle_upload(contents, filename):
     Output("import-confirm-result", "children"),
     Output("parsed-data-store", "data", allow_duplicate=True),
     Output("parsed-pipe-data-store", "data", allow_duplicate=True),
-    Output("parsed-archive-baseline-store", "data", allow_duplicate=True),
     Input("confirm-import-btn", "n_clicks"),
     State("parsed-data-store", "data"),
     State("parsed-pipe-data-store", "data"),
-    State("parsed-archive-baseline-store", "data"),
     prevent_initial_call=True,
 )
-def confirm_import(n_clicks, stored_json, stored_pipe_json, stored_archive_json):
+def confirm_import(n_clicks, stored_json, stored_pipe_json):
     if not n_clicks or not stored_json:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     df = pd.read_json(io.StringIO(stored_json), orient="split")
     written = upsert_repair_rates(df)
@@ -647,118 +573,19 @@ def confirm_import(n_clicks, stored_json, stored_pipe_json, stored_archive_json)
         pipe_df = pd.read_json(io.StringIO(stored_pipe_json), orient="split")
         pipe_written = upsert_pipe_repair_details(pipe_df)
 
-    archive_written = 0
-    if stored_archive_json:
-        try:
-            archive_df = pd.read_json(io.StringIO(stored_archive_json), orient="split")
-            archive_written = upsert_historical_baselines(archive_df)
-        except Exception:
-            pass  # best-effort; completed-project archive totals just won't be refreshed
-
     message = f"✅ {written} rows saved to the database."
     if pipe_written:
         message += f" ({pipe_written} pipe-level rows saved.)"
-    if archive_written:
-        message += f" ({archive_written} completed-project archive totals refreshed.)"
 
     return (
         html.Div(message, className="success-text"),
         None,
         None,
-        None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Callback 3: Download baseline template CSV
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("baseline-template-download", "data"),
-    Input("download-baseline-template-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def download_baseline_template(n_clicks):
-    if not n_clicks:
-        return dash.no_update
-    return dcc.send_string(baseline_template_csv(), "historical_baseline_template.csv")
-
-
-# ---------------------------------------------------------------------------
-# Callback 4: Upload baseline CSV -> parse -> validate -> show preview
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("baseline-validation-result", "children"),
-    Output("baseline-preview-table", "children"),
-    Output("confirm-baseline-import-btn", "style"),
-    Output("parsed-baseline-store", "data"),
-    Input("baseline-upload", "contents"),
-    State("baseline-upload", "filename"),
-    prevent_initial_call=True,
-)
-def handle_baseline_upload(contents, filename):
-    if contents is None:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-    try:
-        file_obj = _decode_upload(contents)
-        df, errors = parse_historical_baseline_csv(file_obj)
-    except Exception as exc:  # don't crash the app on an unexpected error
-        error_box = html.Div(
-            f"An unexpected error occurred while reading the file: {exc}",
-            className="validation-box fail",
-        )
-        return error_box, None, {"display": "none"}, None
-
-    validation_box = _baseline_validation_box(errors, len(df))
-
-    if df.empty or errors:
-        return validation_box, None, {"display": "none"}, None
-
-    preview = dash_table.DataTable(
-        data=_table_records(df, list(df.columns)),
-        columns=_table_columns(df.columns),
-        page_size=15,
-        style_table={"overflowX": "auto"},
-        style_cell=TABLE_CELL_STYLE,
-        style_header=TABLE_HEADER_STYLE,
-        style_data_conditional=TABLE_CONDITIONAL_STYLE,
-    )
-
-    return (
-        validation_box,
-        html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
-        {"display": "inline-block"},
-        df.to_json(date_format="iso", orient="split"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Callback 5: "Confirm Baseline Import" -> write to database
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("baseline-import-confirm-result", "children"),
-    Output("parsed-baseline-store", "data", allow_duplicate=True),
-    Input("confirm-baseline-import-btn", "n_clicks"),
-    State("parsed-baseline-store", "data"),
-    prevent_initial_call=True,
-)
-def confirm_baseline_import(n_clicks, stored_json):
-    if not n_clicks or not stored_json:
-        return dash.no_update, dash.no_update
-
-    df = pd.read_json(io.StringIO(stored_json), orient="split")
-    written = upsert_historical_baselines(df)
-    return (
-        html.Div(f"✅ {written} rows saved as historical baseline.", className="success-text"),
-        None,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Callback 6: Download the A3 PDF report for the latest report date
+# Callback 3: Download the A3 PDF report for the latest report date
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -774,34 +601,27 @@ def download_pdf_report(n_clicks):
     if master_df.empty:
         return dash.no_update
 
-    baseline_df = load_historical_baselines()
-    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
-
     latest_date = master_df["date"].max()
-    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date)
+    pdf_bytes = build_pdf_report(master_df, latest_date)
     filename = f"repair_rate_report_{latest_date.date().isoformat()}.pdf"
 
     return dcc.send_bytes(pdf_bytes, filename)
 
 
 # ---------------------------------------------------------------------------
-# Callback 7: Load / refresh the dashboard
+# Callback 4: Load / refresh the dashboard
 # ---------------------------------------------------------------------------
 
 @callback(
     Output("dashboard-content", "children"),
     Input("refresh-dashboard-btn", "n_clicks"),
     Input("import-confirm-result", "children"),  # auto-refresh after a successful import
-    Input("baseline-import-confirm-result", "children"),  # auto-refresh after a baseline import
 )
-def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
+def render_dashboard(_n_clicks, _import_result):
     master_df = load_master_data()
 
     if master_df.empty:
         return _empty_state("No data in the database yet. Upload and import an Excel file first.")
-
-    baseline_df = load_historical_baselines()
-    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
 
     # --- Top summary cards ---
     latest_date = master_df["date"].max()
@@ -814,7 +634,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     # and the line will zigzag/fold back on itself.
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
 
-    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
+    overall_ratio = daily_weighted_repair_ratios(master_df)
     current_overall_ratio = (
         overall_ratio.loc[overall_ratio["date"] == latest_date, "weighted_repair_ratio"].iloc[0]
         if not overall_ratio.empty
@@ -1139,32 +959,6 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     status_fig.update_yaxes(tickformat=".1%")
 
-    # --- Current period vs historical baseline ---
-    current_denom = latest_df["repaired_spiral_length"].sum() * METERS_PER_FOOT
-    current_ratio_value = latest_df["total_repair_amount"].sum() / current_denom if current_denom else 0
-    baseline_ratio_value = 0
-    if not baseline_df.empty:
-        baseline_denom = baseline_df["repaired_spiral_length"].sum() * METERS_PER_FOOT
-        baseline_ratio_value = baseline_df["total_repair_amount"].sum() / baseline_denom if baseline_denom else 0
-    benchmark_fig = px.bar(
-        pd.DataFrame(
-            {
-                "period": ["Current (Latest Day)", "Historical Baseline"],
-                "ratio": [current_ratio_value, baseline_ratio_value],
-            }
-        ),
-        x="period",
-        y="ratio",
-        labels={"period": "", "ratio": "Weighted Repair Ratio"},
-        title="Current vs Historical Baseline Repair Ratio",
-    )
-    benchmark_fig.update_traces(
-        marker_color=[COLOR_COIL, COLOR_MUTED],
-        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
-    )
-    benchmark_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
-    benchmark_fig.update_yaxes(tickformat=".1%")
-
     # --- Latest day detail table ---
     table_columns = [
         "project_no",
@@ -1246,7 +1040,6 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
                 ],
                 className="chart-row",
             ),
-            dcc.Graph(figure=benchmark_fig),
             html.H3("Latest Day — Project Details"),
             detail_table,
         ]
@@ -1348,17 +1141,13 @@ def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repai
     Input("overall-trend-checklist", "value"),
     Input("refresh-dashboard-btn", "n_clicks"),
     Input("import-confirm-result", "children"),
-    Input("baseline-import-confirm-result", "children"),
 )
-def render_overall_trend_chart(selected_series, _n_clicks, _import_result, _baseline_import_result):
+def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
     master_df = load_master_data()
     if master_df.empty or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
 
-    baseline_df = load_historical_baselines()
-    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
-
-    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
+    overall_ratio = daily_weighted_repair_ratios(master_df).copy()
     overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
     overall_ratio["weighted_repair_ratio_incl_skelp"] = overall_ratio["weighted_repair_ratio_incl_skelp"].round(6)
 
@@ -1418,15 +1207,11 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result, _base
     Input("type-trend-checklist", "value"),
     Input("refresh-dashboard-btn", "n_clicks"),
     Input("import-confirm-result", "children"),
-    Input("baseline-import-confirm-result", "children"),
 )
-def render_type_trend_chart(selected_types, _n_clicks, _import_result, _baseline_import_result):
+def render_type_trend_chart(selected_types, _n_clicks, _import_result):
     master_df = load_master_data()
     if master_df.empty or not selected_types:
         return _empty_state("No data available. Import an Excel file first.")
-
-    baseline_df = load_historical_baselines()
-    baseline_df = baseline_df[baseline_df.get("include_in_dashboard", True)] if not baseline_df.empty else baseline_df
 
     _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
     series_by_type = {}
@@ -1434,7 +1219,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result, _baseline
     for p_type in ("Coil", "Plate"):
         if p_type not in selected_types:
             continue
-        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df).copy()
+        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type).copy()
         # Round away floating-point noise (e.g. 7.368510195727456 vs ...455)
         # left over from the division chain — otherwise a genuinely flat
         # series renders as a jittery line and throws off the trend fit.
@@ -1451,7 +1236,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result, _baseline
             )
         )
     if "Mix" in selected_types:
-        overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
+        overall_ratio = daily_weighted_repair_ratios(master_df).copy()
         overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
         series_by_type["Mix"] = overall_ratio
         fig.add_trace(
@@ -1587,7 +1372,7 @@ def render_project_trend(selected_value, selected_series):
 
 
 # ---------------------------------------------------------------------------
-# Callback 8: Pipe-Level Analysis — populate the report date dropdown
+# Callback 5: Pipe-Level Analysis — populate the report date dropdown
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1606,7 +1391,7 @@ def load_pipe_dates(_id, _import_result):
 
 
 # ---------------------------------------------------------------------------
-# Callback 9: Pipe-Level Analysis — populate the project sheet dropdown
+# Callback 6: Pipe-Level Analysis — populate the project sheet dropdown
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1627,7 +1412,7 @@ def load_pipe_sheets(selected_date):
 
 
 # ---------------------------------------------------------------------------
-# Callback 10: Pipe-Level Analysis — render the summary + detail view
+# Callback 7: Pipe-Level Analysis — render the summary + detail view
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1704,7 +1489,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
 
 
 # ---------------------------------------------------------------------------
-# Callback 11: Project Grouping — populate the project sheet dropdown
+# Callback 8: Project Grouping — populate the project sheet dropdown
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1722,7 +1507,7 @@ def load_group_sheets(_id):
 
 
 # ---------------------------------------------------------------------------
-# Callback 12: Project Grouping — load the saved config for a sheet
+# Callback 9: Project Grouping — load the saved config for a sheet
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1742,7 +1527,7 @@ def load_group_config(selected_sheet):
 
 
 # ---------------------------------------------------------------------------
-# Callback 13: Project Grouping — save the group spec for a sheet
+# Callback 10: Project Grouping — save the group spec for a sheet
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1761,7 +1546,7 @@ def save_groups(n_clicks, selected_sheet, pipe_groups, machine_groups):
 
 
 # ---------------------------------------------------------------------------
-# Callback 14: Dimension Detail — populate the dimension dropdown
+# Callback 11: Dimension Detail — populate the dimension dropdown
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -1782,7 +1567,7 @@ def load_dimension_options(_id, _import_result):
 
 
 # ---------------------------------------------------------------------------
-# Callback 15: Dimension Detail — compare projects sharing the selected dimension
+# Callback 12: Dimension Detail — compare projects sharing the selected dimension
 # ---------------------------------------------------------------------------
 
 @callback(
