@@ -1071,45 +1071,26 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
     )
     ratio_pareto_fig.update_xaxes(tickangle=-45)
 
-    # --- Production quality and volume matrix (bubble plot): volume (pipe
-    # length), quality (spiral repair ratio) and repair amount in one view ---
-    bubble_df = latest_df[["project_label", "project_total_pipe_length", "repair_ratio", "total_repair_amount"]].copy()
+    # --- Production quality and volume matrix (bubble plot): volume,
+    # quality (spiral repair ratio) and repair amount in one view. Two
+    # variants side by side (temporary, for comparison) — one using total
+    # pipe length as the X axis, one using spiral length — pick a winner
+    # and drop the other later.
+    bubble_df = latest_df[
+        ["project_label", "project_total_pipe_length", "repaired_spiral_length", "repair_ratio", "total_repair_amount"]
+    ].copy()
     bubble_df["repair_ratio_pct"] = (bubble_df["repair_ratio"] * 100).round(4)
-    bubble_fig = go.Figure()
-    bubble_fig.add_trace(
-        go.Scatter(
-            x=bubble_df["project_total_pipe_length"],
-            y=bubble_df["repair_ratio_pct"],
-            mode="markers",
-            text=bubble_df["project_label"],
-            marker=dict(
-                size=bubble_df["total_repair_amount"],
-                sizemode="area",
-                sizeref=2.0 * bubble_df["total_repair_amount"].max() / (40.0**2),
-                sizemin=4,
-                color=bubble_df["repair_ratio_pct"],
-                colorscale="YlOrRd",
-                showscale=True,
-                colorbar=dict(title="Repair Ratio (%)"),
-                opacity=0.55,
-                line=dict(color="black", width=1.5),
-            ),
-            hovertemplate=(
-                "%{text}<br>"
-                "Total Pipe Length: <b>%{x:.1f} ft</b><br>"
-                "Spiral Repair Ratio: <b>%{y:.2f}%</b><br>"
-                "Total Repair Amount: <b>%{marker.size:.2f} mt</b>"
-                "<extra></extra>"
-            ),
-        )
-    )
-    bubble_fig.update_layout(
+    bubble_fig = _build_bubble_fig(
+        bubble_df,
+        x_col="project_total_pipe_length",
+        x_label="Total Production Pipe Length (ft)",
         title="Repair Ratio vs. Production Volume by Project (Latest Day)",
-        xaxis_title="Total Production Pipe Length (ft)",
-        yaxis_title="Spiral Repair Ratio (%)",
-        template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
-        hoverlabel=HOVER_STYLE,
+    )
+    bubble_fig_spiral = _build_bubble_fig(
+        bubble_df,
+        x_col="repaired_spiral_length",
+        x_label="Total Spiral Length (ft)",
+        title="Repair Ratio vs. Spiral Length by Project (Latest Day)",
     )
 
     production_types = sorted(master_df["production_type"].dropna().unique())
@@ -1255,6 +1236,7 @@ def render_dashboard(_n_clicks, _import_result, _baseline_import_result):
             dcc.Graph(figure=ratio_pareto_fig),
             dcc.Graph(figure=pareto_fig),
             dcc.Graph(figure=bubble_fig),
+            dcc.Graph(figure=bubble_fig_spiral),
             dcc.Graph(figure=dimension_ratio_fig),
             dcc.Graph(figure=bar_fig),
             html.Div(
@@ -1276,6 +1258,48 @@ def _summary_card(label: str, value: str) -> html.Div:
         [html.Div(value, className="summary-value"), html.Div(label, className="summary-label")],
         className="summary-card",
     )
+
+
+def _build_bubble_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go.Figure:
+    """Bubble plot: X = ``x_col``, Y = repair_ratio_pct, size = repair
+    amount (mt), color = repair_ratio_pct on a yellow-to-red scale."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df[x_col],
+            y=df["repair_ratio_pct"],
+            mode="markers",
+            text=df["project_label"],
+            marker=dict(
+                size=df["total_repair_amount"],
+                sizemode="area",
+                sizeref=2.0 * df["total_repair_amount"].max() / (40.0**2),
+                sizemin=4,
+                color=df["repair_ratio_pct"],
+                colorscale="YlOrRd",
+                showscale=True,
+                colorbar=dict(title="Repair Ratio (%)"),
+                opacity=0.55,
+                line=dict(color="black", width=1.5),
+            ),
+            hovertemplate=(
+                "%{text}<br>"
+                f"{x_label}: <b>%{{x:.1f}} ft</b><br>"
+                "Spiral Repair Ratio: <b>%{y:.2f}%</b><br>"
+                "Total Repair Amount: <b>%{marker.size:.2f} mt</b>"
+                "<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title="Spiral Repair Ratio (%)",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+    )
+    return fig
 
 
 def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repair_ratio"):
