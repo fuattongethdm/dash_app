@@ -1,10 +1,15 @@
 """
 Module 2: parses the Excel-supplier's (JSW) coil cert export — a wide,
-one-row-per-coil "Cert" sheet (see `module 2 exam files/JD Fields Cert
-6-10-26.xlsx`) — into the same PdfCertResult shape the SDI PDF parser
-produces, so both sources feed the same build_report_rows/
+one-row-per-coil sheet (see `module 2 exam files/JD Fields Cert
+6-10-26.xlsx`, sheet "Cert") — into the same PdfCertResult shape the SDI
+PDF parser produces, so both sources feed the same build_report_rows/
 build_report_workbook pipeline in pdf_cert_parser.py and end up in one
 identical "Report" layout.
+
+The sheet holding this data isn't always named "Cert" — JSW's exports
+vary. Every sheet in the workbook is checked for the required column
+headers (order and position don't matter, just presence), and the first
+one that has them all is used, rather than assuming a fixed sheet name.
 
 Unlike the PDF, this is already a clean table — column lookup by header
 name, no text-position guessing needed.
@@ -35,8 +40,6 @@ _COLUMN_MAP = {
 for _element in CHEMISTRY_ELEMENTS:
     _COLUMN_MAP[_element] = _element
 
-REQUIRED_SHEET_NAME = "Cert"
-
 
 def _to_number(value: object) -> float | None:
     if value is None or value == "":
@@ -47,8 +50,33 @@ def _to_number(value: object) -> float | None:
         return None
 
 
+def _find_cert_sheet(wb) -> tuple[str, dict[str, int]] | None:
+    """Return (sheet_name, header->column_index) for the first sheet whose
+    header row has every column _COLUMN_MAP needs, or None if none do."""
+    best_sheet: str | None = None
+    best_missing: list[str] | None = None
+    for sheet_name in wb.sheetnames:
+        header = next(wb[sheet_name].iter_rows(values_only=True), None)
+        if header is None:
+            continue
+        col_index = {name: idx for idx, name in enumerate(header) if name}
+        missing = [col for col in _COLUMN_MAP.values() if col not in col_index]
+        if not missing:
+            return sheet_name, col_index
+        if best_missing is None or len(missing) < len(best_missing):
+            best_sheet, best_missing = sheet_name, missing
+    if best_sheet is not None:
+        raise ValueError(
+            f"No sheet has all the expected coil-cert columns. Closest match: "
+            f"'{best_sheet}' is missing {', '.join(best_missing)}."
+        )
+    return None
+
+
 def parse_jsw_cert_excel(file: str | Path | BinaryIO, source_file: str) -> list[PdfCertResult]:
-    """One PdfCertResult per data row (= per coil) in the "Cert" sheet."""
+    """One PdfCertResult per data row (= per coil), from whichever sheet in
+    the workbook has the expected coil-cert columns (sheet name itself is
+    not assumed — see module docstring)."""
     try:
         wb = load_workbook(file, read_only=True, data_only=True)
     except Exception as exc:
@@ -56,25 +84,22 @@ def parse_jsw_cert_excel(file: str | Path | BinaryIO, source_file: str) -> list[
         result.errors.append(f"Could not open Excel file: {exc}")
         return [result]
 
-    if REQUIRED_SHEET_NAME not in wb.sheetnames:
+    try:
+        match = _find_cert_sheet(wb)
+    except ValueError as exc:
         result = PdfCertResult(source_file=source_file)
-        result.errors.append(f"Sheet '{REQUIRED_SHEET_NAME}' not found (found: {', '.join(wb.sheetnames)})")
+        result.errors.append(str(exc))
         return [result]
 
-    ws = wb[REQUIRED_SHEET_NAME]
+    if match is None:
+        result = PdfCertResult(source_file=source_file)
+        result.errors.append(f"No usable sheet found (checked: {', '.join(wb.sheetnames)})")
+        return [result]
+
+    sheet_name, col_index = match
+    ws = wb[sheet_name]
     rows_iter = ws.iter_rows(values_only=True)
-    header = next(rows_iter, None)
-    if header is None:
-        result = PdfCertResult(source_file=source_file)
-        result.errors.append("Sheet is empty")
-        return [result]
-
-    col_index = {name: idx for idx, name in enumerate(header) if name}
-    missing = [col for col in _COLUMN_MAP.values() if col not in col_index]
-    if missing:
-        result = PdfCertResult(source_file=source_file)
-        result.errors.append(f"Missing expected columns: {', '.join(missing)}")
-        return [result]
+    next(rows_iter, None)  # header row, already consumed by _find_cert_sheet's own read
 
     results: list[PdfCertResult] = []
     for row_idx, row in enumerate(rows_iter, start=2):
@@ -82,7 +107,7 @@ def parse_jsw_cert_excel(file: str | Path | BinaryIO, source_file: str) -> list[
         if coil_number in (None, ""):
             continue  # blank trailing row
 
-        row_source = f"{source_file} (row {row_idx})"
+        row_source = f"{source_file} [{sheet_name}] (row {row_idx})"
         result = PdfCertResult(source_file=row_source)
 
         heat_no = row[col_index["HEAT_NUMBER"]]
