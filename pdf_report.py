@@ -98,14 +98,14 @@ def _trend_chart(overall_ratio: pd.DataFrame) -> Image:
     return _figure_to_image(fig, _HALF_WIDTH)
 
 
-def _type_trend_chart(master_df: pd.DataFrame) -> Image:
+def _type_trend_chart(master_df: pd.DataFrame, baseline_df: pd.DataFrame | None = None) -> Image:
     production_types = sorted(master_df["production_type"].dropna().unique())
     type_colors = {"Coil": _ACCENT, "Plate": _PLATE}
-    overall_ratio = daily_weighted_repair_ratios(master_df)
+    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
 
     fig, ax = plt.subplots(figsize=(7, 3.6))
     for p_type in production_types:
-        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type)
+        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df)
         ax.plot(
             type_trend["date"],
             type_trend["weighted_repair_ratio"] * 100,
@@ -298,7 +298,7 @@ def _side_by_side(left: Image, right: Image) -> Table:
     return row
 
 
-def build_pdf_report(master_df: pd.DataFrame, selected_date) -> bytes:
+def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selected_date) -> bytes:
     """Build an A3-landscape PDF report for the given report date.
 
     `master_df` is the same frame used to render the dashboard (see
@@ -311,7 +311,7 @@ def build_pdf_report(master_df: pd.DataFrame, selected_date) -> bytes:
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
     latest_df["repair_ratio_pct"] = (latest_df["repair_ratio"] * 100).round(4)
 
-    overall_ratio = daily_weighted_repair_ratios(master_df)
+    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
     current_ratio = (
         overall_ratio.loc[overall_ratio["date"] == selected_date, "weighted_repair_ratio"].iloc[0]
         if not overall_ratio.empty
@@ -344,7 +344,7 @@ def build_pdf_report(master_df: pd.DataFrame, selected_date) -> bytes:
             subtitle_style,
         ),
         Spacer(1, 0.4 * cm),
-        _side_by_side(_trend_chart(overall_ratio), _type_trend_chart(master_df)),
+        _side_by_side(_trend_chart(overall_ratio), _type_trend_chart(master_df, baseline_df)),
         Spacer(1, 0.3 * cm),
         _worst_projects_chart(latest_df),
         Spacer(1, 0.3 * cm),

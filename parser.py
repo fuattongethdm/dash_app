@@ -7,6 +7,7 @@ from datetime import date
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
 
 from validators import (
     ValidationReport,
@@ -56,6 +57,22 @@ COLUMN_MAP = {
     "repair_ratio": "O",
     "repair_ratio_incl_skelp": "P",
 }
+
+# Below the daily table, the same sheet keeps a running "Overall Repair
+# Rates" archive of projects that have been completed and removed from the
+# active list above. Excel's own "Overall Repair Rate (2026)" summary cell
+# (Daily Repair Rate!H44, formula =C61) sums this 2026 row range together
+# with the active daily table — without it, the app's overall ratio only
+# reflects currently-active projects and skews away from Excel's figure.
+ARCHIVE_COLUMN_MAP = {
+    "project_no": "B",
+    "repaired_spiral_length": "F",
+    "total_repair_amount": "G",
+    "total_repair_amount_incl_skelp": "H",
+}
+
+ARCHIVE_CURRENT_YEAR_SECTION = {"start_row": 154, "end_row": 217}
+
 
 def _select_sheet(wb):
     available = [name for name in SHEET_CANDIDATES if name in wb.sheetnames]
@@ -179,3 +196,63 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
         df = df[ordered]
 
     return df, validate_dataframe(df, report)
+
+
+def parse_repair_rate_archive(file: str | Path | BinaryIO) -> pd.DataFrame:
+    """Parse the current-year "Overall Repair Rates" archive table beneath
+    the daily table (completed projects removed from the active list).
+
+    Returns a frame shaped for database.upsert_historical_baselines, or an
+    empty frame if the sheet/section isn't found — callers should treat
+    this as best-effort supplementary data, not block the main import on it.
+    """
+    try:
+        wb = load_workbook(file, read_only=True, data_only=True)
+    except Exception:
+        return pd.DataFrame()
+
+    sheet_name = _select_sheet(wb)
+    if sheet_name is None:
+        return pd.DataFrame()
+    ws = wb[sheet_name]
+
+    section = ARCHIVE_CURRENT_YEAR_SECTION
+    col_index = {key: column_index_from_string(letter) for key, letter in ARCHIVE_COLUMN_MAP.items()}
+
+    # Single sequential pass instead of per-cell bracket access — random
+    # cell access on a read_only worksheet re-scans from the start of the
+    # sheet on every call, which is what made the pipe-level parser take
+    # 73s before it was switched to this same pattern (see project_parser.py).
+    grid: dict[tuple[int, int], object] = {}
+    rows_iter = ws.iter_rows(min_row=section["start_row"], max_row=section["end_row"], values_only=True)
+    for row_idx, row in enumerate(rows_iter, start=section["start_row"]):
+        for col_idx, value in enumerate(row, start=1):
+            if value is not None:
+                grid[(row_idx, col_idx)] = value
+
+    rows: list[dict[str, object]] = []
+    for excel_row in range(section["start_row"], section["end_row"] + 1):
+        project_no = normalize_spaces(grid.get((excel_row, col_index["project_no"])))
+        if not project_no:
+            continue
+
+        spiral_length = coerce_number(grid.get((excel_row, col_index["repaired_spiral_length"])))
+        repair_amount = coerce_number(grid.get((excel_row, col_index["total_repair_amount"])))
+        repair_amount_incl_skelp = coerce_number(grid.get((excel_row, col_index["total_repair_amount_incl_skelp"])))
+        if spiral_length is None or repair_amount is None:
+            continue
+
+        rows.append(
+            {
+                "project_no": project_no,
+                "dimensions": "Archived",
+                "repaired_spiral_length": spiral_length,
+                "total_repair_amount": repair_amount,
+                "total_repair_amount_incl_skelp": (
+                    repair_amount_incl_skelp if repair_amount_incl_skelp is not None else repair_amount
+                ),
+                "project_status": "Completed",
+            }
+        )
+
+    return pd.DataFrame(rows)

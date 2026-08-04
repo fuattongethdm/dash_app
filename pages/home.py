@@ -35,14 +35,16 @@ from calculations import (
 )
 from database import (
     get_existing_keys,
+    load_historical_baselines,
     load_master_data,
     load_pipe_repair_details,
     load_project_group_config,
+    upsert_historical_baselines,
     upsert_pipe_repair_details,
     upsert_project_group_config,
     upsert_repair_rates,
 )
-from parser import parse_daily_repair_rate
+from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
 from project_parser import parse_project_pipe_repairs
@@ -185,6 +187,7 @@ def layout():
             # Keep the parsed (not-yet-written) data in the browser.
             dcc.Store(id="parsed-data-store"),
             dcc.Store(id="parsed-pipe-data-store"),
+            dcc.Store(id="parsed-archive-baseline-store"),
             dcc.Tabs(
                 id="dashboard-tabs",
                 value="tab-dashboard",
@@ -471,13 +474,14 @@ def _empty_state(message: str) -> html.Div:
     Output("confirm-import-btn", "style"),
     Output("parsed-data-store", "data"),
     Output("parsed-pipe-data-store", "data"),
+    Output("parsed-archive-baseline-store", "data"),
     Input("excel-upload", "contents"),
     State("excel-upload", "filename"),
     prevent_initial_call=True,
 )
 def handle_upload(contents, filename):
     if contents is None:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     try:
         file_obj = _decode_upload(contents)
@@ -487,7 +491,7 @@ def handle_upload(contents, filename):
             f"An unexpected error occurred while reading the file: {exc}",
             className="validation-box fail",
         )
-        return error_box, None, None, {"display": "none"}, None, None
+        return error_box, None, None, {"display": "none"}, None, None, None
 
     if not df.empty and report.ok:
         # Tell the user upfront whether this import will overwrite existing
@@ -501,7 +505,7 @@ def handle_upload(contents, filename):
     validation_box = _validation_summary(report)
 
     if df.empty or not report.ok:
-        return validation_box, None, None, {"display": "none"}, None, None
+        return validation_box, None, None, {"display": "none"}, None, None, None
 
     preview_columns = [c for c in df.columns if c != "excel_row"]
     preview = dash_table.DataTable(
@@ -538,6 +542,15 @@ def handle_upload(contents, filename):
 
     pipe_summary = html.Div(summary_lines) if summary_lines else None
 
+    archive_data_json = None
+    try:
+        archive_file_obj = _decode_upload(contents)
+        archive_df = parse_repair_rate_archive(archive_file_obj)
+        if not archive_df.empty:
+            archive_data_json = archive_df.to_json(orient="split")
+    except Exception:
+        pass  # best-effort; completed-project archive totals just won't be refreshed
+
     return (
         validation_box,
         html.Div([html.H4(f"Preview — {filename}"), preview], className="preview-box"),
@@ -545,6 +558,7 @@ def handle_upload(contents, filename):
         {"display": "inline-block"},
         df.to_json(date_format="iso", orient="split"),
         pipe_data_json,
+        archive_data_json,
     )
 
 
@@ -556,14 +570,16 @@ def handle_upload(contents, filename):
     Output("import-confirm-result", "children"),
     Output("parsed-data-store", "data", allow_duplicate=True),
     Output("parsed-pipe-data-store", "data", allow_duplicate=True),
+    Output("parsed-archive-baseline-store", "data", allow_duplicate=True),
     Input("confirm-import-btn", "n_clicks"),
     State("parsed-data-store", "data"),
     State("parsed-pipe-data-store", "data"),
+    State("parsed-archive-baseline-store", "data"),
     prevent_initial_call=True,
 )
-def confirm_import(n_clicks, stored_json, stored_pipe_json):
+def confirm_import(n_clicks, stored_json, stored_pipe_json, stored_archive_json):
     if not n_clicks or not stored_json:
-        return dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     df = pd.read_json(io.StringIO(stored_json), orient="split")
     written = upsert_repair_rates(df)
@@ -573,12 +589,23 @@ def confirm_import(n_clicks, stored_json, stored_pipe_json):
         pipe_df = pd.read_json(io.StringIO(stored_pipe_json), orient="split")
         pipe_written = upsert_pipe_repair_details(pipe_df)
 
+    archive_written = 0
+    if stored_archive_json:
+        try:
+            archive_df = pd.read_json(io.StringIO(stored_archive_json), orient="split")
+            archive_written = upsert_historical_baselines(archive_df)
+        except Exception:
+            pass  # best-effort; completed-project archive totals just won't be refreshed
+
     message = f"✅ {written} rows saved to the database."
     if pipe_written:
         message += f" ({pipe_written} pipe-level rows saved.)"
+    if archive_written:
+        message += f" ({archive_written} completed-project archive totals refreshed.)"
 
     return (
         html.Div(message, className="success-text"),
+        None,
         None,
         None,
     )
@@ -601,8 +628,9 @@ def download_pdf_report(n_clicks):
     if master_df.empty:
         return dash.no_update
 
+    baseline_df = load_historical_baselines()
     latest_date = master_df["date"].max()
-    pdf_bytes = build_pdf_report(master_df, latest_date)
+    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date)
     filename = f"repair_rate_report_{latest_date.date().isoformat()}.pdf"
 
     return dcc.send_bytes(pdf_bytes, filename)
@@ -623,6 +651,8 @@ def render_dashboard(_n_clicks, _import_result):
     if master_df.empty:
         return _empty_state("No data in the database yet. Upload and import an Excel file first.")
 
+    baseline_df = load_historical_baselines()
+
     # --- Top summary cards ---
     latest_date = master_df["date"].max()
     latest_df = master_df[master_df["date"] == latest_date]
@@ -634,7 +664,7 @@ def render_dashboard(_n_clicks, _import_result):
     # and the line will zigzag/fold back on itself.
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
 
-    overall_ratio = daily_weighted_repair_ratios(master_df)
+    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
     current_overall_ratio = (
         overall_ratio.loc[overall_ratio["date"] == latest_date, "weighted_repair_ratio"].iloc[0]
         if not overall_ratio.empty
@@ -1147,7 +1177,8 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
     if master_df.empty or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
 
-    overall_ratio = daily_weighted_repair_ratios(master_df).copy()
+    baseline_df = load_historical_baselines()
+    overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
     overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
     overall_ratio["weighted_repair_ratio_incl_skelp"] = overall_ratio["weighted_repair_ratio_incl_skelp"].round(6)
 
@@ -1213,13 +1244,14 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
     if master_df.empty or not selected_types:
         return _empty_state("No data available. Import an Excel file first.")
 
+    baseline_df = load_historical_baselines()
     _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
     series_by_type = {}
     fig = go.Figure()
     for p_type in ("Coil", "Plate"):
         if p_type not in selected_types:
             continue
-        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type).copy()
+        type_trend = daily_weighted_repair_ratios_for_type(master_df, p_type, baseline_df).copy()
         # Round away floating-point noise (e.g. 7.368510195727456 vs ...455)
         # left over from the division chain — otherwise a genuinely flat
         # series renders as a jittery line and throws off the trend fit.
@@ -1236,7 +1268,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
             )
         )
     if "Mix" in selected_types:
-        overall_ratio = daily_weighted_repair_ratios(master_df).copy()
+        overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
         overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
         series_by_type["Mix"] = overall_ratio
         fig.add_trace(
