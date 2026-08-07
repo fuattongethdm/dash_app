@@ -20,6 +20,7 @@ TABLE_NAME = "repair_rates"
 BASELINE_TABLE_NAME = "historical_baselines"
 PIPE_TABLE_NAME = "pipe_repair_details"
 PROJECT_GROUP_CONFIG_TABLE_NAME = "project_group_configs"
+PROJECT_SHEET_LINK_TABLE_NAME = "project_sheet_links"
 DB_PATH = Path(os.getenv("REPAIR_DB_PATH", str(Path("data") / "daily_repair_rate.sqlite")))
 
 
@@ -83,6 +84,19 @@ CREATE TABLE IF NOT EXISTS project_group_configs (
     machine_groups TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(project_sheet, project_no, dimensions)
+);
+"""
+
+PROJECT_SHEET_LINK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS project_sheet_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_sheet TEXT NOT NULL,
+    project_no TEXT,
+    dimensions TEXT,
+    status TEXT NOT NULL DEFAULT 'confirmed',
+    match_score REAL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_sheet)
 );
 """
 
@@ -154,6 +168,20 @@ INSERT INTO project_group_configs (
 ON CONFLICT(project_sheet, project_no, dimensions) DO UPDATE SET
     pipe_groups = excluded.pipe_groups,
     machine_groups = excluded.machine_groups,
+    updated_at = CURRENT_TIMESTAMP;
+"""
+
+PROJECT_SHEET_LINK_UPSERT_SQL = """
+INSERT INTO project_sheet_links (
+    project_sheet, project_no, dimensions, status, match_score, updated_at
+) VALUES (
+    :project_sheet, :project_no, :dimensions, :status, :match_score, CURRENT_TIMESTAMP
+)
+ON CONFLICT(project_sheet) DO UPDATE SET
+    project_no = excluded.project_no,
+    dimensions = excluded.dimensions,
+    status = excluded.status,
+    match_score = excluded.match_score,
     updated_at = CURRENT_TIMESTAMP;
 """
 
@@ -237,6 +265,7 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     conn.execute(BASELINE_SCHEMA)
     conn.execute(PIPE_SCHEMA)
     conn.execute(PROJECT_GROUP_CONFIG_SCHEMA)
+    conn.execute(PROJECT_SHEET_LINK_SCHEMA)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(repair_rates)").fetchall()}
     if "production_type" not in columns:
         conn.execute("ALTER TABLE repair_rates ADD COLUMN production_type TEXT NOT NULL DEFAULT 'Coil'")
@@ -327,6 +356,62 @@ def upsert_project_group_config(
     if should_close:
         conn.close()
     return 1
+
+
+def upsert_project_sheet_links(rows: list[dict[str, Any]], conn: sqlite3.Connection | None = None) -> int:
+    """Save one or more project_sheet -> project_no/dimensions review decisions.
+
+    Each row is `{project_sheet, project_no, dimensions, status, match_score}`
+    — project_no/dimensions/match_score may be None when status='excluded'."""
+    if not rows:
+        return 0
+    records = [
+        {
+            "project_sheet": row["project_sheet"],
+            "project_no": row.get("project_no"),
+            "dimensions": row.get("dimensions"),
+            "status": row.get("status", "confirmed"),
+            "match_score": row.get("match_score"),
+        }
+        for row in rows
+    ]
+
+    if get_backend_name() == "supabase":
+        client = _get_supabase_client()
+        _execute_with_retry(
+            client.table(PROJECT_SHEET_LINK_TABLE_NAME).upsert(records, on_conflict="project_sheet")
+        )
+        return len(records)
+
+    should_close = conn is None
+    conn = conn or get_connection()
+    init_db(conn)
+    conn.executemany(PROJECT_SHEET_LINK_UPSERT_SQL, records)
+    conn.commit()
+    if should_close:
+        conn.close()
+    return len(records)
+
+
+def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    """Every project_sheet the user has already reviewed (confirmed or excluded)."""
+    empty = pd.DataFrame(columns=["project_sheet", "project_no", "dimensions", "status", "match_score"])
+    if get_backend_name() == "supabase":
+        try:
+            rows = _fetch_supabase_table(PROJECT_SHEET_LINK_TABLE_NAME, ("project_sheet",))
+        except Exception as exc:
+            if PROJECT_SHEET_LINK_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
+                return empty
+            raise
+        return pd.DataFrame(rows) if rows else empty
+
+    should_close = conn is None
+    conn = conn or get_connection()
+    init_db(conn)
+    df = pd.read_sql_query("SELECT * FROM project_sheet_links ORDER BY project_sheet", conn)
+    if should_close:
+        conn.close()
+    return df
 
 
 def _records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:

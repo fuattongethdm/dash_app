@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 
 import dash
 import numpy as np
@@ -39,14 +40,17 @@ from database import (
     load_master_data,
     load_pipe_repair_details,
     load_project_group_config,
+    load_project_sheet_links,
     upsert_historical_baselines,
     upsert_pipe_repair_details,
     upsert_project_group_config,
+    upsert_project_sheet_links,
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report
 from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
+from project_matching import build_candidate_pool, suggest_match_for_sheet
 from project_parser import parse_project_pipe_repairs
 from validators import mark_duplicate_counts
 
@@ -414,6 +418,44 @@ def layout():
                                     ),
                                     html.Button("Save Groups", id="save-groups-btn", className="primary-btn"),
                                     html.Div(id="save-groups-result"),
+                                ],
+                                className="card",
+                            ),
+                        ],
+                    ),
+                    dcc.Tab(
+                        label="Project Mapping",
+                        value="tab-mapping",
+                        style=_TAB_STYLE,
+                        selected_style=_TAB_SELECTED_STYLE,
+                        children=[
+                            html.Section(
+                                [
+                                    html.H2("Project Mapping"),
+                                    html.P(
+                                        "Link each Pipe-Level Analysis sheet name to its matching "
+                                        "Project No + Dimensions from the dashboard, so both sections "
+                                        "use consistent project labels. Only new/unmapped sheets need "
+                                        "review — some sheets may have no current match; use "
+                                        "\"No match / exclude\" for those.",
+                                        className="help-text",
+                                    ),
+                                    html.Div(id="mapping-status-banner"),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [html.Label("Unmapped Sheet"), dcc.Dropdown(id="mapping-sheet-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                            html.Div(
+                                                [html.Label("Best-Guess Match"), dcc.Dropdown(id="mapping-candidate-dropdown")],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    html.Button("Confirm Mapping", id="save-mapping-btn", className="primary-btn"),
+                                    html.Div(id="save-mapping-result"),
                                 ],
                                 className="card",
                             ),
@@ -1426,6 +1468,20 @@ def load_pipe_dates(_id, _import_result):
 # Callback 6: Pipe-Level Analysis — populate the project sheet dropdown
 # ---------------------------------------------------------------------------
 
+def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
+    """project_sheet -> "project_no (dimensions)" for sheets confirmed via the
+    Project Mapping tab. Unmapped/excluded sheets are simply absent — callers
+    should fall back to the raw sheet name, mapping is a display enhancement
+    only."""
+    if links_df.empty:
+        return {}
+    confirmed = links_df[links_df["status"] == "confirmed"]
+    return {
+        row["project_sheet"]: f'{row["project_no"]} ({row["dimensions"]})'
+        for _, row in confirmed.iterrows()
+    }
+
+
 @callback(
     Output("pipe-sheet-dropdown", "options"),
     Output("pipe-sheet-dropdown", "value"),
@@ -1439,7 +1495,8 @@ def load_pipe_sheets(selected_date):
         return [], None
     day_df = df[df["date"].dt.date.astype(str) == selected_date]
     sheets = sorted(day_df["project_sheet"].unique())
-    options = [{"label": s, "value": s} for s in sheets]
+    label_map = _pipe_sheet_label_map(load_project_sheet_links())
+    options = [{"label": label_map.get(s, s), "value": s} for s in sheets]
     return options, options[0]["value"] if options else None
 
 
@@ -1681,3 +1738,96 @@ def render_dimension_detail(selected_dimension):
     )
 
     return html.Div([dcc.Graph(figure=trend_fig), dcc.Graph(figure=fig), table])
+
+
+# ---------------------------------------------------------------------------
+# Callback 13: Project Mapping — populate the unmapped-sheet dropdown
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("mapping-sheet-dropdown", "options"),
+    Output("mapping-sheet-dropdown", "value"),
+    Output("mapping-status-banner", "children"),
+    Input("mapping-sheet-dropdown", "id"),  # fires once, on page load
+    Input("save-mapping-result", "children"),  # re-fires after each confirm
+)
+def load_unmapped_sheets(_id, _save_result):
+    pipe_df = load_pipe_repair_details()
+    if pipe_df.empty:
+        return [], None, None
+
+    all_sheets = sorted(pipe_df["project_sheet"].unique())
+    links_df = load_project_sheet_links()
+    reviewed = set(links_df["project_sheet"]) if not links_df.empty else set()
+    unmapped = [s for s in all_sheets if s not in reviewed]
+
+    if not unmapped:
+        return [], None, html.Div("All sheets are mapped. Nothing to review.", className="success-text")
+
+    options = [{"label": s, "value": s} for s in unmapped]
+    banner = html.Div(f"{len(unmapped)} sheet(s) need review.", className="help-text")
+    return options, options[0]["value"], banner
+
+
+# ---------------------------------------------------------------------------
+# Callback 14: Project Mapping — suggest a best-guess match for the selected sheet
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("mapping-candidate-dropdown", "options"),
+    Output("mapping-candidate-dropdown", "value"),
+    Input("mapping-sheet-dropdown", "value"),
+)
+def load_mapping_suggestion(selected_sheet):
+    if not selected_sheet:
+        return [], None
+
+    pool = build_candidate_pool(load_master_data())
+    ranked = suggest_match_for_sheet(selected_sheet, pool)
+
+    options = [
+        {"label": f'{c["project_no"]} ({c["dimensions"]}) — {c["score"]:.2f}', "value": json.dumps(c)}
+        for c in ranked
+    ]
+    options.append({"label": "No match / exclude this sheet", "value": "__exclude__"})
+
+    best = ranked[0] if ranked else None
+    preselect = json.dumps(best) if best and best["score"] >= 0.6 else "__exclude__"
+    return options, preselect
+
+
+# ---------------------------------------------------------------------------
+# Callback 15: Project Mapping — save the confirmed/excluded mapping
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("save-mapping-result", "children"),
+    Input("save-mapping-btn", "n_clicks"),
+    State("mapping-sheet-dropdown", "value"),
+    State("mapping-candidate-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def save_mapping(n_clicks, selected_sheet, candidate_value):
+    if not n_clicks or not selected_sheet or not candidate_value:
+        return dash.no_update
+
+    if candidate_value == "__exclude__":
+        row = {
+            "project_sheet": selected_sheet,
+            "project_no": None,
+            "dimensions": None,
+            "status": "excluded",
+            "match_score": None,
+        }
+    else:
+        chosen = json.loads(candidate_value)
+        row = {
+            "project_sheet": selected_sheet,
+            "project_no": chosen["project_no"],
+            "dimensions": chosen["dimensions"],
+            "status": "confirmed",
+            "match_score": chosen.get("score"),
+        }
+
+    upsert_project_sheet_links([row])
+    return html.Div(f"✅ Mapping saved for {selected_sheet}.", className="success-text")
