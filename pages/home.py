@@ -1012,60 +1012,6 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     # Production quality/volume matrix (bubble plot) now lives in its own
     # callback (render_bubble_chart) with a view switcher — see below.
 
-    production_types = sorted(master_df["production_type"].dropna().unique())
-    _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
-
-    # --- Weighted repair ratio by production type (latest day) ---
-    type_rows = []
-    for p_type in production_types:
-        type_latest = latest_df[latest_df["production_type"] == p_type]
-        denom = type_latest["repaired_spiral_length"].sum() * METERS_PER_FOOT
-        ratio = type_latest["total_repair_amount"].sum() / denom if denom else 0
-        type_rows.append({"production_type": p_type, "weighted_ratio": ratio})
-    type_analysis_fig = px.bar(
-        pd.DataFrame(type_rows),
-        x="production_type",
-        y="weighted_ratio",
-        color="production_type",
-        color_discrete_map=_TYPE_COLORS,
-        labels={"production_type": "Production Type", "weighted_ratio": "Weighted Repair Ratio"},
-        title="Weighted Repair Ratio by Production Type (Latest Day)",
-    )
-    type_analysis_fig.update_traces(
-        texttemplate="%{y:.1%}",
-        textposition="outside",
-        textfont=dict(size=10),
-        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
-    )
-    type_analysis_fig.update_layout(
-        template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), showlegend=False, hoverlabel=HOVER_STYLE
-    )
-    type_analysis_fig.update_yaxes(tickformat=".1%")
-
-    # --- Weighted repair ratio by status (latest day) ---
-    status_rows = []
-    for status in sorted(latest_df["project_status"].dropna().unique()):
-        status_latest = latest_df[latest_df["project_status"] == status]
-        denom = status_latest["repaired_spiral_length"].sum() * METERS_PER_FOOT
-        ratio = status_latest["total_repair_amount"].sum() / denom if denom else 0
-        status_rows.append({"project_status": status, "weighted_ratio": ratio})
-    status_fig = px.bar(
-        pd.DataFrame(status_rows),
-        x="project_status",
-        y="weighted_ratio",
-        labels={"project_status": "Status", "weighted_ratio": "Weighted Repair Ratio"},
-        title="Weighted Repair Ratio by Status (Latest Day)",
-    )
-    status_fig.update_traces(
-        marker_color=COLOR_COIL,
-        texttemplate="%{y:.1%}",
-        textposition="outside",
-        textfont=dict(size=10),
-        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
-    )
-    status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
-    status_fig.update_yaxes(tickformat=".1%")
-
     # --- Latest day detail table ---
     table_columns = [
         "project_no",
@@ -1154,13 +1100,6 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             ),
             dcc.Graph(figure=dimension_ratio_fig),
             dcc.Graph(figure=bar_fig),
-            html.Div(
-                [
-                    dcc.Graph(figure=type_analysis_fig, className="chart-half"),
-                    dcc.Graph(figure=status_fig, className="chart-half"),
-                ],
-                className="chart-row",
-            ),
             html.H3("Latest Day — Project Details"),
             detail_table,
         ]
