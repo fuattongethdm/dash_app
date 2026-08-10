@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 
 import dash
 import numpy as np
@@ -27,11 +28,14 @@ from dash.dash_table.Format import Format, Scheme
 
 from calculations import (
     METERS_PER_FOOT,
+    amount_in_display_unit,
     apply_meter_based_repair_ratios,
     daily_weighted_repair_ratios,
     daily_weighted_repair_ratios_for_dimension,
     daily_weighted_repair_ratios_for_type,
+    length_in_display_unit,
     repair_amount_trend_data,
+    unit_label,
 )
 from database import (
     get_existing_keys,
@@ -39,6 +43,7 @@ from database import (
     load_master_data,
     load_pipe_repair_details,
     load_project_group_config,
+    load_project_sheet_links,
     upsert_historical_baselines,
     upsert_pipe_repair_details,
     upsert_project_group_config,
@@ -121,6 +126,7 @@ COLOR_MUTED = "#94a3b8"
 TEXT_COLUMNS = {
     "date",
     "project_no",
+    "project",
     "dimensions",
     "project_status",
     "production_type",
@@ -133,10 +139,11 @@ TEXT_COLUMNS = {
 INTEGER_COLUMNS = {"id", "qty", "pipe_no", "repair_count", "pipe_count", "project_count"}
 
 
-def _table_columns(columns) -> list[dict]:
+def _table_columns(columns, label_overrides: dict[str, str] | None = None) -> list[dict]:
+    label_overrides = label_overrides or {}
     cols = []
     for c in columns:
-        name = COLUMN_LABELS.get(c, c.replace("_", " ").title())
+        name = label_overrides.get(c) or COLUMN_LABELS.get(c, c.replace("_", " ").title())
         if c in PERCENT_COLUMNS:
             cols.append({"name": name, "id": c, "type": "numeric", "format": PERCENT_FORMAT})
         elif c in TEXT_COLUMNS:
@@ -188,6 +195,26 @@ def layout():
             dcc.Store(id="parsed-data-store"),
             dcc.Store(id="parsed-pipe-data-store"),
             dcc.Store(id="parsed-archive-baseline-store"),
+            # Global display-unit toggle — sits above the tabs so it stays
+            # visible/selected while switching tabs, and any callback can
+            # read it directly (its value doubles as shared state, no
+            # separate Store needed).
+            html.Div(
+                [
+                    html.Span("Units:", className="unit-toggle-label"),
+                    dcc.RadioItems(
+                        id="unit-toggle",
+                        options=[
+                            {"label": "Meters (m)", "value": "m"},
+                            {"label": "Feet (ft)", "value": "ft"},
+                        ],
+                        value="m",
+                        inline=True,
+                        className="unit-toggle",
+                    ),
+                ],
+                className="unit-toggle-row",
+            ),
             dcc.Tabs(
                 id="dashboard-tabs",
                 value="tab-dashboard",
@@ -350,7 +377,7 @@ def layout():
                                                 className="filter-field",
                                             ),
                                             html.Div(
-                                                [html.Label("Project Sheet"), dcc.Dropdown(id="pipe-sheet-dropdown")],
+                                                [html.Label("Project"), dcc.Dropdown(id="pipe-sheet-dropdown")],
                                                 className="filter-field",
                                             ),
                                         ],
@@ -461,6 +488,34 @@ def _validation_summary(report) -> html.Div:
 
 def _empty_state(message: str) -> html.Div:
     return html.Div(message, className="empty-state")
+
+
+def _project_label_with_qty(project_no, dimensions, qty) -> str:
+    """Same shape as project_label, but the leading "20XXQ-" report-quarter
+    prefix is replaced with the pipe quantity — more useful at a glance on
+    repair-ratio charts (where the project label is the whole x-axis) than
+    a quarter tag. Amount charts keep the plain project_label untouched."""
+    stripped = re.sub(r"^\d{4}Q-", f"{int(qty)}-", str(project_no))
+    return f"{stripped} ({dimensions})"
+
+
+def _latest_day_frame(master_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.DataFrame]:
+    """Latest report date + that day's rows, with meter-based ratios and
+    both project-label variants attached. Shared by render_dashboard and
+    the bubble-chart callback so the two can never drift out of sync."""
+    latest_date = master_df["date"].max()
+    latest_df = master_df[master_df["date"] == latest_date].copy()
+    latest_df = apply_meter_based_repair_ratios(latest_df)
+    # project_no alone repeats within a day (same project, different
+    # dimensions) — charts that plot per-row project data need a unique
+    # label per row, or a categorical axis shared by two traces (e.g. the
+    # pareto bar+line) will collapse repeated labels onto one x position
+    # and the line will zigzag/fold back on itself.
+    latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
+    latest_df["project_label_qty"] = latest_df.apply(
+        lambda r: _project_label_with_qty(r["project_no"], r["dimensions"], r["qty"]), axis=1
+    )
+    return latest_date, latest_df
 
 
 # ---------------------------------------------------------------------------
@@ -618,9 +673,10 @@ def confirm_import(n_clicks, stored_json, stored_pipe_json, stored_archive_json)
 @callback(
     Output("pdf-report-download", "data"),
     Input("download-pdf-report-btn", "n_clicks"),
+    State("unit-toggle", "value"),
     prevent_initial_call=True,
 )
-def download_pdf_report(n_clicks):
+def download_pdf_report(n_clicks, selected_unit):
     if not n_clicks:
         return dash.no_update
 
@@ -630,7 +686,7 @@ def download_pdf_report(n_clicks):
 
     baseline_df = load_historical_baselines()
     latest_date = master_df["date"].max()
-    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date)
+    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date, display_unit=selected_unit)
     filename = f"repair_rate_report_{latest_date.date().isoformat()}.pdf"
 
     return dcc.send_bytes(pdf_bytes, filename)
@@ -644,25 +700,19 @@ def download_pdf_report(n_clicks):
     Output("dashboard-content", "children"),
     Input("refresh-dashboard-btn", "n_clicks"),
     Input("import-confirm-result", "children"),  # auto-refresh after a successful import
+    Input("unit-toggle", "value"),
 )
-def render_dashboard(_n_clicks, _import_result):
+def render_dashboard(_n_clicks, _import_result, selected_unit):
     master_df = load_master_data()
 
     if master_df.empty:
         return _empty_state("No data in the database yet. Upload and import an Excel file first.")
 
     baseline_df = load_historical_baselines()
+    u = unit_label(selected_unit)
 
     # --- Top summary cards ---
-    latest_date = master_df["date"].max()
-    latest_df = master_df[master_df["date"] == latest_date]
-    latest_df = apply_meter_based_repair_ratios(latest_df)
-    # project_no alone repeats within a day (same project, different
-    # dimensions) — charts that plot per-row project data need a unique
-    # label per row, or a categorical axis shared by two traces (e.g. the
-    # pareto bar+line) will collapse repeated labels onto one x position
-    # and the line will zigzag/fold back on itself.
-    latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
+    latest_date, latest_df = _latest_day_frame(master_df)
 
     overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
     current_overall_ratio = (
@@ -684,17 +734,20 @@ def render_dashboard(_n_clicks, _import_result):
     )
 
     # --- Daily repair amount (bar) ---
-    daily_amount = repair_amount_trend_data(master_df, display_unit="m")
+    daily_amount = repair_amount_trend_data(master_df, display_unit=selected_unit)
     bar_fig = px.bar(
         daily_amount,
         x="date",
         y="daily_repair_amount_display",
-        labels={"date": "Date", "daily_repair_amount_display": "Daily Repair Amount (m)"},
-        title="Daily Repair Amount",
+        labels={"date": "Date", "daily_repair_amount_display": f"Daily Repair Amount ({u})"},
+        title=f"Daily Repair Amount ({u})",
     )
     bar_fig.update_traces(
         marker_color=COLOR_COIL,
-        hovertemplate="%{x|%d.%m.%Y}<br>Daily Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+        texttemplate="%{y:.1f}",
+        textposition="outside",
+        textfont=dict(size=10),
+        hovertemplate="%{x|%d.%m.%Y}<br>Daily Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
     )
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     bar_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
@@ -704,13 +757,16 @@ def render_dashboard(_n_clicks, _import_result):
     worst_fig = px.bar(
         worst,
         x="repair_ratio",
-        y="project_label",
+        y="project_label_qty",
         orientation="h",
-        labels={"repair_ratio": "Repair Ratio", "project_label": "Project"},
+        labels={"repair_ratio": "Repair Ratio", "project_label_qty": "Project"},
         title="Top 10 Projects by Repair Ratio (Latest Day)",
     )
     worst_fig.update_traces(
         marker_color=COLOR_COIL,
+        texttemplate="%{x:.1%}",
+        textposition="outside",
+        textfont=dict(size=10),
         hovertemplate="%{y}<br>Repair Ratio: <b>%{x:.2%}</b><extra></extra>",
     )
     worst_fig.update_layout(
@@ -722,36 +778,42 @@ def render_dashboard(_n_clicks, _import_result):
     worst_fig.update_xaxes(tickformat=".0%")
 
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
-    skelp_df = latest_df[["project_label", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
+    skelp_df = latest_df[["project_label", "project_label_qty", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
     skelp_df["skelp_impact"] = (skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]).round(6)
     skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_label"],
+            x=skelp_top["project_label_qty"],
             y=skelp_top["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
+            texttemplate="%{y:.1%}",
+            textposition="inside",
+            textfont=dict(size=10, color="white"),
             hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_label"],
+            x=skelp_top["project_label_qty"],
             y=skelp_top["skelp_impact"],
             name="Skelp Impact",
             marker_color=COLOR_SECONDARY,
+            texttemplate="+%{y:.1%}",
+            textposition="inside",
+            textfont=dict(size=10, color="white"),
             hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2%}</b><extra></extra>",
         )
     )
     skelp_fig.update_layout(
         barmode="stack",
-        title="Skelp Impact on Repair Ratio (Top 10, Latest Day)",
+        title="Skelp-End Weld Impact on Repair Ratio (Top 10, Latest Day)",
         yaxis_title="Repair Ratio",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
-        xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label_qty"].tolist()),
     )
     skelp_fig.update_xaxes(tickangle=-45)
     skelp_fig.update_yaxes(tickformat=".0%")
@@ -762,6 +824,10 @@ def render_dashboard(_n_clicks, _import_result):
     # by amount — otherwise the two side-by-side charts show different
     # projects and can't be compared directly.
     skelp_amount_df = latest_df[["project_label", "total_repair_amount", "total_repair_amount_incl_skelp"]].copy()
+    skelp_amount_df["total_repair_amount"] = amount_in_display_unit(skelp_amount_df["total_repair_amount"], selected_unit)
+    skelp_amount_df["total_repair_amount_incl_skelp"] = amount_in_display_unit(
+        skelp_amount_df["total_repair_amount_incl_skelp"], selected_unit
+    )
     skelp_amount_df["skelp_impact_amount"] = (
         skelp_amount_df["total_repair_amount_incl_skelp"] - skelp_amount_df["total_repair_amount"]
     ).round(4)
@@ -775,25 +841,31 @@ def render_dashboard(_n_clicks, _import_result):
         go.Bar(
             x=skelp_amount_top["project_label"],
             y=skelp_amount_top["total_repair_amount"],
-            name="Repair Amount (m)",
+            name=f"Repair Amount ({u})",
             marker_color=COLOR_COIL,
-            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+            texttemplate="%{y:.1f}",
+            textposition="inside",
+            textfont=dict(size=10, color="white"),
+            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
         )
     )
     skelp_amount_fig.add_trace(
         go.Bar(
             x=skelp_amount_top["project_label"],
             y=skelp_amount_top["skelp_impact_amount"],
-            name="Skelp Impact (m)",
+            name=f"Skelp Impact ({u})",
             marker_color=COLOR_SECONDARY,
             customdata=skelp_amount_top["pct_increase"],
-            hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2f} m</b> (+%{customdata:.1f}%)<extra></extra>",
+            texttemplate="+%{y:.1f}",
+            textposition="inside",
+            textfont=dict(size=10, color="white"),
+            hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2f} " + u + "</b> (+%{customdata:.1f}%)<extra></extra>",
         )
     )
     skelp_amount_fig.update_layout(
         barmode="stack",
-        title="Skelp Impact on Repair Amount (Same Top 10 as Ratio Impact)",
-        yaxis_title="Repair Amount (m)",
+        title=f"Skelp-End Weld Impact on Repair Amount ({u}, Same Top 10 as Ratio Impact)",
+        yaxis_title=f"Repair Amount ({u})",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
@@ -829,6 +901,9 @@ def render_dashboard(_n_clicks, _import_result):
     )
     dimension_ratio_fig.update_traces(
         marker_color=COLOR_COIL,
+        texttemplate="%{y:.1%}",
+        textposition="outside",
+        textfont=dict(size=10),
         hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
@@ -839,6 +914,7 @@ def render_dashboard(_n_clicks, _import_result):
     pareto_df = latest_df[["project_label", "total_repair_amount"]].sort_values(
         "total_repair_amount", ascending=False
     ).reset_index(drop=True)
+    pareto_df["total_repair_amount"] = amount_in_display_unit(pareto_df["total_repair_amount"], selected_unit)
     pareto_df["cumulative_pct"] = (
         pareto_df["total_repair_amount"].cumsum() / pareto_df["total_repair_amount"].sum() * 100
     )
@@ -847,9 +923,12 @@ def render_dashboard(_n_clicks, _import_result):
         go.Bar(
             x=pareto_df["project_label"],
             y=pareto_df["total_repair_amount"],
-            name="Repair Amount (m)",
+            name=f"Repair Amount ({u})",
             marker_color=COLOR_COIL,
-            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} m</b><extra></extra>",
+            texttemplate="%{y:.1f}",
+            textposition="outside",
+            textfont=dict(size=9),
+            hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
         )
     )
     pareto_fig.add_trace(
@@ -859,14 +938,17 @@ def render_dashboard(_n_clicks, _import_result):
             name="Cumulative %",
             yaxis="y2",
             line=dict(color=COLOR_SECONDARY, width=2),
-            mode="lines+markers",
+            mode="lines+markers+text",
+            text=pareto_df["cumulative_pct"].map(lambda v: f"{v:.0f}%"),
+            textposition="top center",
+            textfont=dict(size=9, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     pareto_fig.update_layout(
-        title="Repair Amount Pareto (Latest Day)",
+        title=f"Repair Amount Pareto — Cumulative Contribution ({u}, Latest Day)",
         template="plotly_white",
-        yaxis=dict(title="Repair Amount (m)"),
+        yaxis=dict(title=f"Repair Amount ({u})"),
         yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
         margin=dict(l=40, r=40, t=50, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -882,7 +964,7 @@ def render_dashboard(_n_clicks, _import_result):
     # --- Repair ratio pareto: same idea, but ranked by repair ratio instead
     # of absolute amount, so a small pipe with a very high ratio still shows
     # up as a top contributor even if its absolute meters are small ---
-    ratio_pareto_df = latest_df[["project_label", "repair_ratio"]].sort_values(
+    ratio_pareto_df = latest_df[["project_label_qty", "repair_ratio"]].sort_values(
         "repair_ratio", ascending=False
     ).reset_index(drop=True)
     ratio_pareto_df["cumulative_pct"] = (
@@ -891,57 +973,44 @@ def render_dashboard(_n_clicks, _import_result):
     ratio_pareto_fig = go.Figure()
     ratio_pareto_fig.add_trace(
         go.Bar(
-            x=ratio_pareto_df["project_label"],
+            x=ratio_pareto_df["project_label_qty"],
             y=ratio_pareto_df["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
+            texttemplate="%{y:.1%}",
+            textposition="outside",
+            textfont=dict(size=9),
             hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
     ratio_pareto_fig.add_trace(
         go.Scatter(
-            x=ratio_pareto_df["project_label"],
+            x=ratio_pareto_df["project_label_qty"],
             y=ratio_pareto_df["cumulative_pct"],
             name="Cumulative %",
             yaxis="y2",
             line=dict(color=COLOR_SECONDARY, width=2),
-            mode="lines+markers",
+            mode="lines+markers+text",
+            text=ratio_pareto_df["cumulative_pct"].map(lambda v: f"{v:.0f}%"),
+            textposition="top center",
+            textfont=dict(size=9, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
     ratio_pareto_fig.update_layout(
-        title="Repair Ratio Pareto (Latest Day)",
+        title="Repair Ratio Pareto — Cumulative Contribution (Latest Day)",
         template="plotly_white",
         yaxis=dict(title="Repair Ratio", tickformat=".0%"),
         yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
         margin=dict(l=40, r=40, t=50, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hoverlabel=HOVER_STYLE,
-        xaxis=dict(categoryorder="array", categoryarray=ratio_pareto_df["project_label"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=ratio_pareto_df["project_label_qty"].tolist()),
     )
     ratio_pareto_fig.update_xaxes(tickangle=-45)
 
-    # --- Production quality and volume matrix (bubble plot): volume,
-    # quality (spiral repair ratio) and repair amount in one view. Two
-    # variants side by side (temporary, for comparison) — one using total
-    # pipe length as the X axis, one using spiral length — pick a winner
-    # and drop the other later.
-    bubble_df = latest_df[
-        ["project_label", "project_total_pipe_length", "repaired_spiral_length", "repair_ratio", "total_repair_amount"]
-    ].copy()
-    bubble_df["repair_ratio_pct"] = (bubble_df["repair_ratio"] * 100).round(4)
-    bubble_fig = _build_bubble_fig(
-        bubble_df,
-        x_col="project_total_pipe_length",
-        x_label="Total Production Pipe Length (ft)",
-        title="Repair Ratio vs. Production Volume by Project (Latest Day)",
-    )
-    bubble_fig_spiral = _build_bubble_fig(
-        bubble_df,
-        x_col="repaired_spiral_length",
-        x_label="Total Spiral Length (ft)",
-        title="Repair Ratio vs. Spiral Length by Project (Latest Day)",
-    )
+    # Production quality/volume matrix (bubble plot) now lives in its own
+    # callback (render_bubble_chart) with a view switcher — see below.
 
     production_types = sorted(master_df["production_type"].dropna().unique())
     _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
@@ -962,7 +1031,12 @@ def render_dashboard(_n_clicks, _import_result):
         labels={"production_type": "Production Type", "weighted_ratio": "Weighted Repair Ratio"},
         title="Weighted Repair Ratio by Production Type (Latest Day)",
     )
-    type_analysis_fig.update_traces(hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>")
+    type_analysis_fig.update_traces(
+        texttemplate="%{y:.1%}",
+        textposition="outside",
+        textfont=dict(size=10),
+        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
     type_analysis_fig.update_layout(
         template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), showlegend=False, hoverlabel=HOVER_STYLE
     )
@@ -984,6 +1058,9 @@ def render_dashboard(_n_clicks, _import_result):
     )
     status_fig.update_traces(
         marker_color=COLOR_COIL,
+        texttemplate="%{y:.1%}",
+        textposition="outside",
+        textfont=dict(size=10),
         hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     status_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
@@ -1047,7 +1124,7 @@ def render_dashboard(_n_clicks, _import_result):
                         className="chart-half",
                     ),
                 ],
-                className="chart-row",
+                className="chart-row chart-row-stacked",
             ),
             dcc.Graph(figure=worst_fig),
             html.Div(
@@ -1059,8 +1136,22 @@ def render_dashboard(_n_clicks, _import_result):
             ),
             dcc.Graph(figure=ratio_pareto_fig),
             dcc.Graph(figure=pareto_fig),
-            dcc.Graph(figure=bubble_fig),
-            dcc.Graph(figure=bubble_fig_spiral),
+            html.Div(
+                [
+                    dcc.RadioItems(
+                        id="bubble-view-toggle",
+                        options=[
+                            {"label": "By Project — Spiral Length", "value": "project_spiral"},
+                            {"label": "By Project — Pipe Length", "value": "project_pipe"},
+                            {"label": "By Dimension — Spiral Length", "value": "dimension_spiral"},
+                        ],
+                        value="project_spiral",
+                        inline=True,
+                    ),
+                    dcc.Loading(html.Div(id="bubble-chart-content")),
+                ],
+                className="bubble-view-row",
+            ),
             dcc.Graph(figure=dimension_ratio_fig),
             dcc.Graph(figure=bar_fig),
             html.Div(
@@ -1083,16 +1174,30 @@ def _summary_card(label: str, value: str) -> html.Div:
     )
 
 
-def _build_bubble_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go.Figure:
+def _build_bubble_fig(
+    df: pd.DataFrame,
+    x_col: str,
+    x_label: str,
+    title: str,
+    unit: str,
+    label_col: str = "project_label",
+) -> go.Figure:
     """Bubble plot: X = ``x_col``, Y = repair_ratio_pct, size = repair
-    amount (mt), color = repair_ratio_pct on a yellow-to-red scale."""
+    amount, color = repair_ratio_pct on a yellow-to-red scale. ``df``'s
+    ``x_col``/``total_repair_amount`` are expected to already be converted
+    to ``unit`` by the caller — this only formats labels/hover text.
+    ``label_col`` is "project_label" for the by-project views, or
+    "dimensions" for the by-dimension view."""
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=df[x_col],
             y=df["repair_ratio_pct"],
-            mode="markers",
-            text=df["project_label"],
+            mode="markers+text",
+            text=df["repair_ratio_pct"].map(lambda v: f"{v:.1f}%"),
+            textposition="top center",
+            textfont=dict(size=9),
+            customdata=df[label_col],
             marker=dict(
                 size=df["total_repair_amount"],
                 sizemode="area",
@@ -1106,10 +1211,10 @@ def _build_bubble_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) ->
                 line=dict(color="black", width=1.5),
             ),
             hovertemplate=(
-                "%{text}<br>"
-                f"{x_label}: <b>%{{x:.1f}} ft</b><br>"
+                "%{customdata}<br>"
+                f"{x_label}: <b>%{{x:.1f}} {unit}</b><br>"
                 "Spiral Repair Ratio: <b>%{y:.2f}%</b><br>"
-                "Total Repair Amount: <b>%{marker.size:.2f} mt</b>"
+                f"Total Repair Amount: <b>%{{marker.size:.2f}} {unit}</b>"
                 "<extra></extra>"
             ),
         )
@@ -1123,6 +1228,74 @@ def _build_bubble_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) ->
         hoverlabel=HOVER_STYLE,
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Callback: Production quality/volume matrix (bubble plot) — a view switcher
+# picks between two per-project variants (pipe length / spiral length on the
+# X axis) and one per-dimension variant, all sharing the same builder above.
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("bubble-chart-content", "children"),
+    Input("bubble-view-toggle", "value"),
+    Input("unit-toggle", "value"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),
+)
+def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result):
+    master_df = load_master_data()
+    if master_df.empty:
+        return _empty_state("No data available. Import an Excel file first.")
+
+    _latest_date, latest_df = _latest_day_frame(master_df)
+    u = unit_label(selected_unit)
+
+    if selected_view == "dimension_spiral":
+        dim_df = latest_df.groupby("dimensions", as_index=False).agg(
+            repaired_spiral_length=("repaired_spiral_length", "sum"),
+            total_repair_amount=("total_repair_amount", "sum"),
+        )
+        denom = dim_df["repaired_spiral_length"] * METERS_PER_FOOT
+        dim_df["repair_ratio_pct"] = ((dim_df["total_repair_amount"] / denom.where(denom != 0)).fillna(0) * 100).round(4)
+        dim_df["repaired_spiral_length"] = length_in_display_unit(dim_df["repaired_spiral_length"], selected_unit)
+        dim_df["total_repair_amount"] = amount_in_display_unit(dim_df["total_repair_amount"], selected_unit)
+        fig = _build_bubble_fig(
+            dim_df,
+            x_col="repaired_spiral_length",
+            x_label=f"Total Spiral Length ({u})",
+            title=f"Repair Ratio vs. Production Volume by Dimension ({u}, Spiral Length, Latest Day)",
+            unit=u,
+            label_col="dimensions",
+        )
+        return dcc.Graph(figure=fig)
+
+    bubble_df = latest_df[
+        ["project_label", "project_total_pipe_length", "repaired_spiral_length", "repair_ratio", "total_repair_amount"]
+    ].copy()
+    bubble_df["repair_ratio_pct"] = (bubble_df["repair_ratio"] * 100).round(4)
+    bubble_df["project_total_pipe_length"] = length_in_display_unit(bubble_df["project_total_pipe_length"], selected_unit)
+    bubble_df["repaired_spiral_length"] = length_in_display_unit(bubble_df["repaired_spiral_length"], selected_unit)
+    bubble_df["total_repair_amount"] = amount_in_display_unit(bubble_df["total_repair_amount"], selected_unit)
+
+    if selected_view == "project_pipe":
+        fig = _build_bubble_fig(
+            bubble_df,
+            x_col="project_total_pipe_length",
+            x_label=f"Total Production Pipe Length ({u})",
+            title=f"Repair Ratio vs. Production Volume by Project ({u}, Pipe Length, Latest Day)",
+            unit=u,
+        )
+    else:
+        fig = _build_bubble_fig(
+            bubble_df,
+            x_col="repaired_spiral_length",
+            x_label=f"Total Spiral Length ({u})",
+            title=f"Repair Ratio vs. Production Volume by Project ({u}, Spiral Length, Latest Day)",
+            unit=u,
+        )
+
+    return dcc.Graph(figure=fig)
 
 
 def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repair_ratio"):
@@ -1188,9 +1361,12 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
             go.Scatter(
                 x=overall_ratio["date"],
                 y=overall_ratio["weighted_repair_ratio"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name="Excl. Skelp",
                 line=dict(color=COLOR_COIL, width=3),
+                text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="top center",
+                textfont=dict(size=9, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1199,9 +1375,12 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
             go.Scatter(
                 x=overall_ratio["date"],
                 y=overall_ratio["weighted_repair_ratio_incl_skelp"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name="Incl. Skelp",
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+                text=(overall_ratio["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="bottom center",
+                textfont=dict(size=9, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1214,11 +1393,19 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
         if trend_trace is not None:
             fig.add_trace(trend_trace)
 
+    if len(selected_series) == 2:
+        title = "Overall Repair Rate Trend (Excl. vs Incl. Skelp)"
+    elif selected_series == ["Excl"]:
+        title = "Overall Repair Rate Trend (Excl. Skelp)"
+    else:
+        title = "Overall Repair Rate Trend — Skelp-Inclusive Trend"
+
     fig.update_layout(
-        title="Overall Repair Rate Trend",
+        title=title,
         yaxis_title="Repair Rate (%)",
         xaxis_title="Date",
         template="plotly_white",
+        height=580,
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
@@ -1261,9 +1448,12 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
             go.Scatter(
                 x=type_trend["date"],
                 y=type_trend["weighted_repair_ratio"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name=p_type,
                 line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
+                text=(type_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="top center",
+                textfont=dict(size=9, color=_TYPE_COLORS.get(p_type)),
                 hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
@@ -1275,9 +1465,12 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
             go.Scatter(
                 x=overall_ratio["date"],
                 y=overall_ratio["weighted_repair_ratio"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name="Mix (Coil + Plate)",
                 line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
+                text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="bottom center",
+                textfont=dict(size=9, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1289,11 +1482,24 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
         if trend_trace is not None:
             fig.add_trace(trend_trace)
 
+    _TYPE_DISPLAY = {"Coil": "Coil", "Plate": "Plate", "Mix": "Mix"}
+    ordered_selected = [t for t in ("Coil", "Plate", "Mix") if t in selected_types]
+    if len(ordered_selected) == 1:
+        title = f"Repair Rate Trend by Production Type — {_TYPE_DISPLAY[ordered_selected[0]]}"
+    elif len(ordered_selected) == 2:
+        title = (
+            "Repair Rate Trend by Production Type — "
+            f"{_TYPE_DISPLAY[ordered_selected[0]]} vs {_TYPE_DISPLAY[ordered_selected[1]]}"
+        )
+    else:
+        title = "Repair Rate Trend by Production Type"
+
     fig.update_layout(
-        title="Repair Rate Trend by Production Type",
+        title=title,
         yaxis_title="Repair Rate (%)",
         xaxis_title="Date",
         template="plotly_white",
+        height=580,
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
@@ -1364,9 +1570,12 @@ def render_project_trend(selected_value, selected_series):
             go.Scatter(
                 x=project_df["date"],
                 y=project_df["repair_ratio"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name="Excl. Skelp",
                 line=dict(color=COLOR_COIL, width=3),
+                text=(project_df["repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="top center",
+                textfont=dict(size=9, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1375,9 +1584,12 @@ def render_project_trend(selected_value, selected_series):
             go.Scatter(
                 x=project_df["date"],
                 y=project_df["repair_ratio_incl_skelp"] * 100,
-                mode="lines+markers",
+                mode="lines+markers+text",
                 name="Incl. Skelp",
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+                text=(project_df["repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+                textposition="bottom center",
+                textfont=dict(size=9, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1390,8 +1602,15 @@ def render_project_trend(selected_value, selected_series):
         if trend_trace is not None:
             fig.add_trace(trend_trace)
 
+    if len(selected_series) == 2:
+        skelp_suffix = " (Excl. vs Incl. Skelp)"
+    elif selected_series == ["Excl"]:
+        skelp_suffix = " (Excl. Skelp)"
+    else:
+        skelp_suffix = " — Skelp-Inclusive Trend"
+
     fig.update_layout(
-        title=f"Repair Ratio Trend — {project_no} ({dimensions})",
+        title=f"Repair Ratio Trend — {project_no} ({dimensions}){skelp_suffix}",
         yaxis_title="Repair Ratio (%)",
         xaxis_title="Date",
         template="plotly_white",
@@ -1423,8 +1642,21 @@ def load_pipe_dates(_id, _import_result):
 
 
 # ---------------------------------------------------------------------------
-# Callback 6: Pipe-Level Analysis — populate the project sheet dropdown
+# Callback 6: Pipe-Level Analysis — populate the project dropdown
 # ---------------------------------------------------------------------------
+
+def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
+    """project_sheet -> "project_no (dimensions)" for sheets confirmed via the
+    "Project Mapping" review tool (feature/project-sheet-mapping-tool branch).
+    Sheets with no confirmed mapping are simply absent from this map."""
+    if links_df.empty:
+        return {}
+    confirmed = links_df[links_df["status"] == "confirmed"]
+    return {
+        row["project_sheet"]: f'{row["project_no"]} ({row["dimensions"]})'
+        for _, row in confirmed.iterrows()
+    }
+
 
 @callback(
     Output("pipe-sheet-dropdown", "options"),
@@ -1438,8 +1670,13 @@ def load_pipe_sheets(selected_date):
     if df.empty:
         return [], None
     day_df = df[df["date"].dt.date.astype(str) == selected_date]
-    sheets = sorted(day_df["project_sheet"].unique())
-    options = [{"label": s, "value": s} for s in sheets]
+    sheets = set(day_df["project_sheet"].unique())
+    # Only sheets with a confirmed project mapping show up here — the raw
+    # Excel sheet name isn't meaningful to look at directly, and mixing
+    # mapped/unmapped entries in one dropdown was confusing.
+    label_map = _pipe_sheet_label_map(load_project_sheet_links())
+    mapped_sheets = sorted(sheets & label_map.keys(), key=lambda s: label_map[s])
+    options = [{"label": label_map[s], "value": s} for s in mapped_sheets]
     return options, options[0]["value"] if options else None
 
 
@@ -1451,19 +1688,34 @@ def load_pipe_sheets(selected_date):
     Output("pipe-analysis-content", "children"),
     Input("pipe-date-dropdown", "value"),
     Input("pipe-sheet-dropdown", "value"),
+    Input("unit-toggle", "value"),
 )
-def render_pipe_analysis(selected_date, selected_sheet):
+def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
+    u = unit_label(selected_unit)
     if not selected_date:
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
     df = load_pipe_repair_details()
     day_df = df[df["date"].dt.date.astype(str) == selected_date]
 
-    summary_table = summarize_pipe_totals_by_sheet(day_df)
+    # Only show sheets with a confirmed project mapping — the raw Excel
+    # sheet name on its own isn't meaningful here (see the
+    # feature/project-sheet-mapping-tool branch for how mappings are made).
+    label_map = _pipe_sheet_label_map(load_project_sheet_links())
+    mapped_day_df = day_df[day_df["project_sheet"].isin(label_map)]
+
+    if mapped_day_df.empty:
+        return _empty_state(
+            "No mapped projects for this date yet. Check out the "
+            "feature/project-sheet-mapping-tool branch to link sheets first."
+        )
+
+    summary_table = summarize_pipe_totals_by_sheet(mapped_day_df).rename(columns={"project_sheet": "project"})
+    summary_table["project"] = summary_table["project"].map(label_map)
     summary_columns = list(summary_table.columns)
     summary_section = html.Div(
         [
-            html.H3("All Project Sheets — Summary"),
+            html.H3("All Projects — Summary"),
             dash_table.DataTable(
                 data=_table_records(summary_table, summary_columns),
                 columns=_table_columns(summary_columns),
@@ -1480,6 +1732,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
     if not selected_sheet:
         return summary_section
 
+    sheet_label = label_map.get(selected_sheet, selected_sheet)
     sheet_df = day_df[day_df["project_sheet"] == selected_sheet].sort_values("pipe_no")
 
     worst_fig = px.bar(
@@ -1487,20 +1740,32 @@ def render_pipe_analysis(selected_date, selected_sheet):
         x="pipe_no",
         y="repair_ratio",
         labels={"pipe_no": "Pipe No.", "repair_ratio": "Repair Ratio"},
-        title=f"Top 15 Pipes by Repair Ratio — {selected_sheet}",
+        title=f"Top 15 Pipes by Repair Ratio — {sheet_label}",
     )
     worst_fig.update_traces(
         marker_color=COLOR_COIL,
+        texttemplate="%{y:.1%}",
+        textposition="outside",
+        textfont=dict(size=9),
         hovertemplate="Pipe %{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     worst_fig.update_xaxes(type="category")
     worst_fig.update_yaxes(tickformat=".1%")
 
-    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state", "repair_category")]
+    sheet_df = sheet_df.copy()
+    if "pipe_length_ft" in sheet_df.columns:
+        sheet_df["pipe_length_ft"] = length_in_display_unit(sheet_df["pipe_length_ft"], selected_unit)
+    if "repair_amount" in sheet_df.columns:
+        sheet_df["repair_amount"] = amount_in_display_unit(sheet_df["repair_amount"], selected_unit)
+
+    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state", "repair_category", "project_sheet")]
     detail_table = dash_table.DataTable(
         data=_table_records(sheet_df, detail_columns),
-        columns=_table_columns(detail_columns),
+        columns=_table_columns(
+            detail_columns,
+            label_overrides={"pipe_length_ft": f"Pipe Length ({u})", "repair_amount": f"Repair Amount ({u})"},
+        ),
         page_size=20,
         sort_action="native",
         filter_action="native",
@@ -1513,7 +1778,7 @@ def render_pipe_analysis(selected_date, selected_sheet):
     return html.Div(
         [
             summary_section,
-            html.H3(f"{selected_sheet} — Pipe Details"),
+            html.H3(f"{sheet_label} — Pipe Details"),
             dcc.Graph(figure=worst_fig),
             detail_table,
         ]
@@ -1617,9 +1882,15 @@ def render_dimension_detail(selected_dimension):
 
     dim_df = latest_df[latest_df["dimensions"] == selected_dimension].sort_values(
         "repair_ratio", ascending=False
-    )
+    ).copy()
     if dim_df.empty:
         return _empty_state("No projects found for this dimension on the latest day.")
+
+    # Repair-ratio chart — same "qty instead of the 20XXQ- prefix" label as
+    # the dashboard's ratio charts (Skelp/Pareto Ratio).
+    dim_df["project_label_qty"] = dim_df.apply(
+        lambda r: _project_label_with_qty(r["project_no"], r["dimensions"], r["qty"]), axis=1
+    )
 
     dim_trend = daily_weighted_repair_ratios_for_dimension(master_df, selected_dimension)
     trend_fig = go.Figure()
@@ -1627,9 +1898,12 @@ def render_dimension_detail(selected_dimension):
         go.Scatter(
             x=dim_trend["date"],
             y=dim_trend["weighted_repair_ratio"] * 100,
-            mode="lines+markers",
+            mode="lines+markers+text",
             name="Excl. Skelp",
             line=dict(color=COLOR_COIL, width=3),
+            text=(dim_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+            textposition="top center",
+            textfont=dict(size=9, color=COLOR_COIL),
             hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -1637,9 +1911,12 @@ def render_dimension_detail(selected_dimension):
         go.Scatter(
             x=dim_trend["date"],
             y=dim_trend["weighted_repair_ratio_incl_skelp"] * 100,
-            mode="lines+markers",
+            mode="lines+markers+text",
             name="Incl. Skelp",
             line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
+            text=(dim_trend["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+            textposition="bottom center",
+            textfont=dict(size=9, color=COLOR_SECONDARY),
             hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -1655,13 +1932,16 @@ def render_dimension_detail(selected_dimension):
 
     fig = px.bar(
         dim_df,
-        x="project_no",
+        x="project_label_qty",
         y="repair_ratio",
-        labels={"project_no": "Project", "repair_ratio": "Repair Ratio"},
+        labels={"project_label_qty": "Project", "repair_ratio": "Repair Ratio"},
         title=f"Projects with Dimension {selected_dimension} (Latest Day)",
     )
     fig.update_traces(
         marker_color=COLOR_COIL,
+        texttemplate="%{y:.1%}",
+        textposition="outside",
+        textfont=dict(size=10),
         hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)

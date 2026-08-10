@@ -26,10 +26,13 @@ from reportlab.lib.units import cm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from calculations import (
+    amount_in_display_unit,
     apply_meter_based_repair_ratios,
     daily_weighted_repair_ratios,
     daily_weighted_repair_ratios_for_type,
+    length_in_display_unit,
     repair_amount_trend_data,
+    unit_label,
 )
 
 _ACCENT = "#2563eb"  # Coil / primary (matches dashboard COLOR_COIL)
@@ -131,10 +134,10 @@ def _type_trend_chart(master_df: pd.DataFrame, baseline_df: pd.DataFrame | None 
     return _figure_to_image(fig, _HALF_WIDTH)
 
 
-def _amount_chart(daily_amount: pd.DataFrame) -> Image:
+def _amount_chart(daily_amount: pd.DataFrame, unit: str) -> Image:
     fig, ax = plt.subplots(figsize=(14, 3.6))
     ax.bar(daily_amount["date"], daily_amount["daily_repair_amount_display"], color=_ACCENT)
-    ax.set_ylabel("Amount (m)")
+    ax.set_ylabel(f"Amount ({unit})")
     _style_axes(ax, "Daily Repair Amount")
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -151,7 +154,7 @@ def _worst_projects_chart(latest_df: pd.DataFrame) -> Image:
     return _figure_to_image(fig, _USABLE_WIDTH)
 
 
-def _skelp_impact_charts(latest_df: pd.DataFrame) -> tuple[Image, Image]:
+def _skelp_impact_charts(latest_df: pd.DataFrame, unit: str) -> tuple[Image, Image]:
     """Same top-10 projects (ranked by ratio impact) in both charts, so
     they stay directly comparable — mirrors the dashboard's skelp-impact
     pair (pages/home.py, render_dashboard)."""
@@ -177,16 +180,16 @@ def _skelp_impact_charts(latest_df: pd.DataFrame) -> tuple[Image, Image]:
     ratio_img = _figure_to_image(fig1, _HALF_WIDTH)
 
     fig2, ax2 = plt.subplots(figsize=(7, 4.2))
-    ax2.bar(x, amount_top["total_repair_amount"], color=_ACCENT, label="Repair Amount (m)")
+    ax2.bar(x, amount_top["total_repair_amount"], color=_ACCENT, label=f"Repair Amount ({unit})")
     ax2.bar(
         x,
         amount_top["skelp_impact_amount"],
         bottom=amount_top["total_repair_amount"],
         color=_ACCENT2,
-        label="Skelp Impact (m)",
+        label=f"Skelp Impact ({unit})",
     )
     _project_x_labels(ax2, amount_top["project_label"])
-    ax2.set_ylabel("Repair Amount (m)")
+    ax2.set_ylabel(f"Repair Amount ({unit})")
     ax2.legend(fontsize=8, frameon=False)
     _style_axes(ax2, "Skelp Impact on Repair Amount (Same Top 10 as Ratio Impact)")
     fig2.tight_layout()
@@ -298,12 +301,14 @@ def _side_by_side(left: Image, right: Image) -> Table:
     return row
 
 
-def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selected_date) -> bytes:
+def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selected_date, display_unit: str = "m") -> bytes:
     """Build an A3-landscape PDF report for the given report date.
 
     `master_df` is the same frame used to render the dashboard (see
-    pages/home.py:render_dashboard).
+    pages/home.py:render_dashboard). `display_unit` ("m" or "ft") mirrors
+    the dashboard's unit toggle at the time the PDF was requested.
     """
+    u = unit_label(display_unit)
     latest_df = master_df[master_df["date"] == selected_date].copy()
     latest_df = apply_meter_based_repair_ratios(latest_df)
     # Same fix as the dashboard: project_no alone repeats across dimensions,
@@ -311,13 +316,23 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
     latest_df["repair_ratio_pct"] = (latest_df["repair_ratio"] * 100).round(4)
 
+    # Ratios above are computed from the raw feet/meter columns (the
+    # dashboard standard) — only convert to the display unit afterwards, so
+    # every chart below shows/scales consistently with the unit toggle.
+    latest_df["total_repair_amount"] = amount_in_display_unit(latest_df["total_repair_amount"], display_unit)
+    latest_df["total_repair_amount_incl_skelp"] = amount_in_display_unit(
+        latest_df["total_repair_amount_incl_skelp"], display_unit
+    )
+    latest_df["project_total_pipe_length"] = length_in_display_unit(latest_df["project_total_pipe_length"], display_unit)
+    latest_df["repaired_spiral_length"] = length_in_display_unit(latest_df["repaired_spiral_length"], display_unit)
+
     overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df)
     current_ratio = (
         overall_ratio.loc[overall_ratio["date"] == selected_date, "weighted_repair_ratio"].iloc[0]
         if not overall_ratio.empty
         else 0
     )
-    daily_amount = repair_amount_trend_data(master_df, display_unit="m")
+    daily_amount = repair_amount_trend_data(master_df, display_unit=display_unit)
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -333,7 +348,7 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
     subtitle_style = ParagraphStyle("ReportSubtitle", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#64748b"))
     section_style = styles["Heading2"]
 
-    skelp_ratio_img, skelp_amount_img = _skelp_impact_charts(latest_df)
+    skelp_ratio_img, skelp_amount_img = _skelp_impact_charts(latest_df, u)
 
     story = [
         Paragraph("Daily Repair Rate Report", title_style),
@@ -352,23 +367,25 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
         Spacer(1, 0.3 * cm),
         _pareto_chart(latest_df, "repair_ratio", "Repair Ratio (%)", "Repair Ratio Pareto (Latest Day)", as_pct=True),
         Spacer(1, 0.3 * cm),
-        _pareto_chart(latest_df, "total_repair_amount", "Repair Amount (m)", "Repair Amount Pareto (Latest Day)", as_pct=False),
+        _pareto_chart(
+            latest_df, "total_repair_amount", f"Repair Amount ({u})", f"Repair Amount Pareto ({u}, Latest Day)", as_pct=False
+        ),
         Spacer(1, 0.3 * cm),
         _bubble_chart(
             latest_df,
             "project_total_pipe_length",
-            "Total Production Pipe Length (ft)",
+            f"Total Production Pipe Length ({u})",
             "Repair Ratio vs. Production Volume by Project (Latest Day)",
         ),
         Spacer(1, 0.3 * cm),
         _bubble_chart(
             latest_df,
             "repaired_spiral_length",
-            "Total Spiral Length (ft)",
+            f"Total Spiral Length ({u})",
             "Repair Ratio vs. Spiral Length by Project (Latest Day)",
         ),
         Spacer(1, 0.3 * cm),
-        _amount_chart(daily_amount),
+        _amount_chart(daily_amount, u),
         Spacer(1, 0.5 * cm),
         Paragraph("Latest Day — Project Details", section_style),
         Spacer(1, 0.2 * cm),

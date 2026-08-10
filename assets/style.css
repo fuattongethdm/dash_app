@@ -208,6 +208,35 @@ body {
   min-width: 320px;
 }
 
+.chart-row-stacked {
+  flex-direction: column;
+}
+
+.unit-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+}
+
+.unit-toggle-label {
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.unit-toggle label {
+  margin-right: 12px;
+}
+
+.bubble-view-row {
+  margin: 16px 0;
+}
+
+.bubble-view-row .radio-items label,
+.bubble-view-row label {
+  margin-right: 16px;
+}
+
 .filter-row {
   display: flex;
   gap: 16px;
