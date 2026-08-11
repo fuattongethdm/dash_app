@@ -964,7 +964,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     dimension_ratio_fig.update_yaxes(tickformat=".1%")
 
     # --- Repair amount pareto: which projects drive most of the total ---
-    pareto_df = latest_df[["project_label", "total_repair_amount"]].sort_values(
+    pareto_df = latest_df[["project_label_clean", "qty", "total_repair_amount"]].sort_values(
         "total_repair_amount", ascending=False
     ).reset_index(drop=True)
     pareto_df["total_repair_amount"] = amount_in_display_unit(pareto_df["total_repair_amount"], selected_unit)
@@ -974,7 +974,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     pareto_fig = go.Figure()
     pareto_fig.add_trace(
         go.Bar(
-            x=pareto_df["project_label"],
+            x=pareto_df["project_label_clean"],
             y=pareto_df["total_repair_amount"],
             name=f"Repair Amount ({u})",
             marker_color=COLOR_COIL,
@@ -986,7 +986,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     )
     pareto_fig.add_trace(
         go.Scatter(
-            x=pareto_df["project_label"],
+            x=pareto_df["project_label_clean"],
             y=pareto_df["cumulative_pct"],
             name="Cumulative %",
             yaxis="y2",
@@ -1010,9 +1010,12 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         # mean the x labels aren't unique — pin the category order explicitly
         # so the bar and the cumulative line can't be reshuffled onto the
         # same tick and zigzag.
-        xaxis=dict(categoryorder="array", categoryarray=pareto_df["project_label"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=pareto_df["project_label_clean"].tolist()),
     )
     pareto_fig.update_xaxes(tickangle=-45)
+    _add_bar_value_annotations(
+        pareto_fig, pareto_df["project_label_clean"], pareto_df["total_repair_amount"], pareto_df["qty"]
+    )
 
     # --- Repair ratio pareto: same idea, but ranked by repair ratio instead
     # of absolute amount, so a small pipe with a very high ratio still shows
