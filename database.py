@@ -190,7 +190,14 @@ def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+_supabase_client = None
+
+
 def _get_supabase_client():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+
     try:
         from supabase import create_client
     except ImportError as exc:
@@ -205,7 +212,8 @@ def _get_supabase_client():
         if os.getenv(proxy_var, "").strip().lower() == "http://127.0.0.1:9":
             os.environ.pop(proxy_var, None)
 
-    return create_client(url, key)
+    _supabase_client = create_client(url, key)
+    return _supabase_client
 
 
 def _execute_with_retry(query, retries: int = 2, delay: float = 0.6):
@@ -239,6 +247,38 @@ def _fetch_supabase_table(table_name: str, order_columns: tuple[str, ...], page_
         if len(response.data) < page_size:
             break
     return rows
+
+
+# ---------------------------------------------------------------------------
+# In-process cache for the full-table loaders below. The Dashboard tab fires
+# many independent callbacks on every page load, and several of them load
+# the exact same table (e.g. load_master_data() is called from 8 different
+# callbacks) — without this, each one pays its own full Supabase round trip.
+# Keyed by table name; a short TTL is a safety net for data changed outside
+# this app's own write path, on top of explicit invalidation on every write.
+# ---------------------------------------------------------------------------
+
+_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_CACHE_TTL_SECONDS = 120
+
+
+def _cache_get(key: str) -> pd.DataFrame | None:
+    entry = _CACHE.get(key)
+    if entry is None:
+        return None
+    cached_at, df = entry
+    if time.time() - cached_at > _CACHE_TTL_SECONDS:
+        return None
+    return df.copy()
+
+
+def _cache_set(key: str, df: pd.DataFrame) -> None:
+    _CACHE[key] = (time.time(), df.copy())
+
+
+def _cache_invalidate(*keys: str) -> None:
+    for key in keys:
+        _CACHE.pop(key, None)
 
 
 def init_db(conn: sqlite3.Connection | None = None) -> None:
@@ -348,15 +388,22 @@ def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataF
     """Every project_sheet -> project_no/dimensions mapping confirmed via the
     "Project Mapping" review tool (feature/project-sheet-mapping-tool branch).
     Read-only here — mappings are written from that branch, not this one."""
+    cached = _cache_get(PROJECT_SHEET_LINK_TABLE_NAME)
+    if cached is not None:
+        return cached
+
     empty = pd.DataFrame(columns=["project_sheet", "project_no", "dimensions", "status", "match_score"])
     if get_backend_name() == "supabase":
         try:
             rows = _fetch_supabase_table(PROJECT_SHEET_LINK_TABLE_NAME, ("project_sheet",))
         except Exception as exc:
             if PROJECT_SHEET_LINK_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
+                _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, empty)
                 return empty
             raise
-        return pd.DataFrame(rows) if rows else empty
+        df = pd.DataFrame(rows) if rows else empty
+        _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, df)
+        return df
 
     should_close = conn is None
     conn = conn or get_connection()
@@ -364,6 +411,7 @@ def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataF
     df = pd.read_sql_query("SELECT * FROM project_sheet_links ORDER BY project_sheet", conn)
     if should_close:
         conn.close()
+    _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, df)
     return df
 
 
@@ -407,6 +455,7 @@ def upsert_historical_baselines(df: pd.DataFrame, conn: sqlite3.Connection | Non
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
         _execute_with_retry(client.table(BASELINE_TABLE_NAME).upsert(records, on_conflict="project_no,dimensions"))
+        _cache_invalidate(BASELINE_TABLE_NAME)
         return len(records)
 
     should_close = conn is None
@@ -416,15 +465,21 @@ def upsert_historical_baselines(df: pd.DataFrame, conn: sqlite3.Connection | Non
     conn.commit()
     if should_close:
         conn.close()
+    _cache_invalidate(BASELINE_TABLE_NAME)
     return len(records)
 
 
 def load_historical_baselines(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    cached = _cache_get(BASELINE_TABLE_NAME)
+    if cached is not None:
+        return cached
+
     if get_backend_name() == "supabase":
         try:
             rows = _fetch_supabase_table(BASELINE_TABLE_NAME, ("project_no", "dimensions"))
         except Exception as exc:
             if "historical_baselines" in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
+                _cache_set(BASELINE_TABLE_NAME, pd.DataFrame())
                 return pd.DataFrame()
             raise
         df = pd.DataFrame(rows)
@@ -438,6 +493,7 @@ def load_historical_baselines(conn: sqlite3.Connection | None = None) -> pd.Data
 
     if not df.empty:
         df["production_type"] = df["project_no"].map(_infer_baseline_production_type)
+    _cache_set(BASELINE_TABLE_NAME, df)
     return df
 
 
@@ -484,6 +540,7 @@ def upsert_repair_rates(df: pd.DataFrame, conn: sqlite3.Connection | None = None
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
         _execute_with_retry(client.table(TABLE_NAME).upsert(records, on_conflict="date,project_no,dimensions"))
+        _cache_invalidate(TABLE_NAME)
         return len(records)
 
     should_close = conn is None
@@ -493,10 +550,15 @@ def upsert_repair_rates(df: pd.DataFrame, conn: sqlite3.Connection | None = None
     conn.commit()
     if should_close:
         conn.close()
+    _cache_invalidate(TABLE_NAME)
     return len(records)
 
 
 def load_master_data(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    cached = _cache_get(TABLE_NAME)
+    if cached is not None:
+        return cached
+
     if get_backend_name() == "supabase":
         df = pd.DataFrame(_fetch_supabase_table(TABLE_NAME, ("date", "project_no", "dimensions")))
     else:
@@ -512,6 +574,7 @@ def load_master_data(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
         if "production_type" not in df.columns:
             df["production_type"] = "Coil"
         df["production_type"] = df["production_type"].fillna("Coil")
+    _cache_set(TABLE_NAME, df)
     return df
 
 
@@ -530,6 +593,7 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
                     on_conflict="date,project_sheet,block_cell",
                 )
             )
+        _cache_invalidate(PIPE_TABLE_NAME)
         return len(records)
 
     should_close = conn is None
@@ -539,10 +603,15 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
     conn.commit()
     if should_close:
         conn.close()
+    _cache_invalidate(PIPE_TABLE_NAME)
     return len(records)
 
 
 def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    cached = _cache_get(PIPE_TABLE_NAME)
+    if cached is not None:
+        return cached
+
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
         try:
@@ -560,7 +629,9 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
                     break
         except Exception as exc:
             if PIPE_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
-                return pd.DataFrame()
+                empty = pd.DataFrame()
+                _cache_set(PIPE_TABLE_NAME, empty)
+                return empty
             raise
         df = pd.DataFrame(rows)
     else:
@@ -571,7 +642,9 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
         if should_close:
             conn.close()
 
-    return _normalize_pipe_repair_details(df)
+    df = _normalize_pipe_repair_details(df)
+    _cache_set(PIPE_TABLE_NAME, df)
+    return df
 
 
 def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | None = None) -> pd.DataFrame:

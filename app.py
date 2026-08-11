@@ -49,4 +49,6 @@ app.layout = html.Div(
 
 if __name__ == "__main__":
     # For local development. Production uses gunicorn.
-    app.run(debug=True, host="0.0.0.0", port=8050)
+    # threaded=True lets the dev server handle the several independent
+    # callbacks a page load fires concurrently instead of queuing them.
+    app.run(debug=True, host="0.0.0.0", port=8050, threaded=True)
