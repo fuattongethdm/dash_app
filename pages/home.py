@@ -122,6 +122,15 @@ COLOR_PLATE = "#7c3aed"
 COLOR_SECONDARY = "#f97316"
 COLOR_MUTED = "#94a3b8"
 
+# How many of the most recent days the trend charts (Overall/Type/Project/
+# Dimension Detail) show, and the window the fitted trend line is drawn
+# over — one constant so both stay in sync and are easy to change later.
+TREND_WINDOW_DAYS = 20
+
+# How many of the "worst" (highest repair-ratio) bubbles get their project
+# name shown on the chart instead of just the ratio value.
+BUBBLE_LABEL_TOP_N = 5
+
 
 TEXT_COLUMNS = {
     "date",
@@ -208,7 +217,7 @@ def layout():
                             {"label": "Meters (m)", "value": "m"},
                             {"label": "Feet (ft)", "value": "ft"},
                         ],
-                        value="m",
+                        value="ft",
                         inline=True,
                         className="unit-toggle",
                     ),
@@ -490,13 +499,52 @@ def _empty_state(message: str) -> html.Div:
     return html.Div(message, className="empty-state")
 
 
-def _project_label_with_qty(project_no, dimensions, qty) -> str:
-    """Same shape as project_label, but the leading "20XXQ-" report-quarter
-    prefix is replaced with the pipe quantity — more useful at a glance on
-    repair-ratio charts (where the project label is the whole x-axis) than
-    a quarter tag. Amount charts keep the plain project_label untouched."""
-    stripped = re.sub(r"^\d{4}Q-", f"{int(qty)}-", str(project_no))
+def _project_label_clean(project_no, dimensions) -> str:
+    """Same shape as project_label, but with the leading "20XXQ-"
+    report-quarter prefix stripped — used on the repair-ratio charts, whose
+    bars carry the pipe quantity instead (see _add_bar_value_annotations)."""
+    stripped = re.sub(r"^\d{4}Q-", "", str(project_no))
     return f"{stripped} ({dimensions})"
+
+
+def _add_bar_value_annotations(
+    fig: go.Figure,
+    categories,
+    values,
+    display_values,
+    orientation: str = "v",
+    min_fraction: float = 0.15,
+) -> None:
+    """Write ``display_values`` (e.g. pipe quantity) inside each bar, at the
+    bar's mid-point — skipped for any bar whose value is under
+    ``min_fraction`` of the chart's max, a plain stand-in for "won't fit
+    without overflowing" (there's no real text-vs-bar pixel measurement
+    available at figure-build time)."""
+    values = list(values)
+    max_value = max(values) if values else 0
+    if not max_value:
+        return
+    for category, value, display_value in zip(categories, values, display_values):
+        if value < max_value * min_fraction:
+            continue
+        if orientation == "h":
+            fig.add_annotation(
+                x=value / 2,
+                y=category,
+                text=str(display_value),
+                showarrow=False,
+                font=dict(size=10, color="white"),
+                xanchor="center",
+            )
+        else:
+            fig.add_annotation(
+                x=category,
+                y=value / 2,
+                text=str(display_value),
+                showarrow=False,
+                font=dict(size=10, color="white"),
+                yanchor="middle",
+            )
 
 
 def _latest_day_frame(master_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.DataFrame]:
@@ -512,8 +560,8 @@ def _latest_day_frame(master_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.DataFra
     # pareto bar+line) will collapse repeated labels onto one x position
     # and the line will zigzag/fold back on itself.
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
-    latest_df["project_label_qty"] = latest_df.apply(
-        lambda r: _project_label_with_qty(r["project_no"], r["dimensions"], r["qty"]), axis=1
+    latest_df["project_label_clean"] = latest_df.apply(
+        lambda r: _project_label_clean(r["project_no"], r["dimensions"]), axis=1
     )
     return latest_date, latest_df
 
@@ -728,7 +776,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
                 "Active Project Count",
                 str((latest_df["project_status"] == "In Progress").sum()),
             ),
-            _summary_card("Overall Repair Rate", f"%{current_overall_ratio * 100:.2f}"),
+            _summary_card("Coil and Plate Repair Rate", f"%{current_overall_ratio * 100:.2f}"),
         ],
         className="summary-cards",
     )
@@ -746,27 +794,27 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         marker_color=COLOR_COIL,
         texttemplate="%{y:.1f}",
         textposition="outside",
-        textfont=dict(size=10),
+        textfont=dict(size=11),
         hovertemplate="%{x|%d.%m.%Y}<br>Daily Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
     )
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
-    bar_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+    bar_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     # --- Worst-performing projects (latest day) ---
     worst = latest_df.sort_values("repair_ratio", ascending=False).head(10)
     worst_fig = px.bar(
         worst,
         x="repair_ratio",
-        y="project_label_qty",
+        y="project_label_clean",
         orientation="h",
-        labels={"repair_ratio": "Repair Ratio", "project_label_qty": "Project"},
+        labels={"repair_ratio": "Repair Ratio", "project_label_clean": "Project"},
         title="Top 10 Projects by Repair Ratio (Latest Day)",
     )
     worst_fig.update_traces(
         marker_color=COLOR_COIL,
         texttemplate="%{x:.1%}",
         textposition="outside",
-        textfont=dict(size=10),
+        textfont=dict(size=11),
         hovertemplate="%{y}<br>Repair Ratio: <b>%{x:.2%}</b><extra></extra>",
     )
     worst_fig.update_layout(
@@ -776,33 +824,36 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         hoverlabel=HOVER_STYLE,
     )
     worst_fig.update_xaxes(tickformat=".0%")
+    _add_bar_value_annotations(
+        worst_fig, worst["project_label_clean"], worst["repair_ratio"], worst["qty"], orientation="h"
+    )
 
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
-    skelp_df = latest_df[["project_label", "project_label_qty", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
+    skelp_df = latest_df[["project_label", "project_label_clean", "qty", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
     skelp_df["skelp_impact"] = (skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]).round(6)
     skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_label_qty"],
+            x=skelp_top["project_label_clean"],
             y=skelp_top["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
             texttemplate="%{y:.1%}",
             textposition="inside",
-            textfont=dict(size=10, color="white"),
+            textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
     skelp_fig.add_trace(
         go.Bar(
-            x=skelp_top["project_label_qty"],
+            x=skelp_top["project_label_clean"],
             y=skelp_top["skelp_impact"],
             name="Skelp Impact",
             marker_color=COLOR_SECONDARY,
             texttemplate="+%{y:.1%}",
             textposition="inside",
-            textfont=dict(size=10, color="white"),
+            textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2%}</b><extra></extra>",
         )
     )
@@ -813,16 +864,18 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
-        xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label_qty"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label_clean"].tolist()),
     )
     skelp_fig.update_xaxes(tickangle=-45)
     skelp_fig.update_yaxes(tickformat=".0%")
+    _add_bar_value_annotations(
+        skelp_fig, skelp_top["project_label_clean"], skelp_top["repair_ratio"], skelp_top["qty"]
+    )
 
-    # --- Skelp impact: same as above, but on the repair amount (m) itself
-    # rather than the ratio. Locked to the same top-10 projects (ranked by
-    # ratio impact, from the chart above) instead of picking its own top 10
-    # by amount — otherwise the two side-by-side charts show different
-    # projects and can't be compared directly.
+    # --- Skelp impact: same as above, but on the repair amount itself
+    # rather than the ratio, and ranked by its own metric (skelp_impact_amount)
+    # instead of reusing the ratio chart's top 10 — the two charts can show
+    # different projects.
     skelp_amount_df = latest_df[["project_label", "total_repair_amount", "total_repair_amount_incl_skelp"]].copy()
     skelp_amount_df["total_repair_amount"] = amount_in_display_unit(skelp_amount_df["total_repair_amount"], selected_unit)
     skelp_amount_df["total_repair_amount_incl_skelp"] = amount_in_display_unit(
@@ -831,7 +884,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     skelp_amount_df["skelp_impact_amount"] = (
         skelp_amount_df["total_repair_amount_incl_skelp"] - skelp_amount_df["total_repair_amount"]
     ).round(4)
-    skelp_amount_top = skelp_top[["project_label"]].merge(skelp_amount_df, on="project_label", how="left")
+    skelp_amount_top = skelp_amount_df.sort_values("skelp_impact_amount", ascending=False).head(10)
     skelp_amount_top["pct_increase"] = (
         skelp_amount_top["skelp_impact_amount"]
         / skelp_amount_top["total_repair_amount"].where(skelp_amount_top["total_repair_amount"] != 0)
@@ -845,7 +898,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             marker_color=COLOR_COIL,
             texttemplate="%{y:.1f}",
             textposition="inside",
-            textfont=dict(size=10, color="white"),
+            textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
         )
     )
@@ -858,13 +911,13 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             customdata=skelp_amount_top["pct_increase"],
             texttemplate="+%{y:.1f}",
             textposition="inside",
-            textfont=dict(size=10, color="white"),
+            textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2f} " + u + "</b> (+%{customdata:.1f}%)<extra></extra>",
         )
     )
     skelp_amount_fig.update_layout(
         barmode="stack",
-        title=f"Skelp-End Weld Impact on Repair Amount ({u}, Same Top 10 as Ratio Impact)",
+        title=f"Skelp-End Weld Impact on Repair Amount ({u}, Top 10, Latest Day)",
         yaxis_title=f"Repair Amount ({u})",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
@@ -903,7 +956,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         marker_color=COLOR_COIL,
         texttemplate="%{y:.1%}",
         textposition="outside",
-        textfont=dict(size=10),
+        textfont=dict(size=11),
         hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
@@ -927,7 +980,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             marker_color=COLOR_COIL,
             texttemplate="%{y:.1f}",
             textposition="outside",
-            textfont=dict(size=9),
+            textfont=dict(size=10),
             hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
         )
     )
@@ -941,7 +994,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             mode="lines+markers+text",
             text=pareto_df["cumulative_pct"].map(lambda v: f"{v:.0f}%"),
             textposition="top center",
-            textfont=dict(size=9, color=COLOR_SECONDARY),
+            textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -964,7 +1017,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     # --- Repair ratio pareto: same idea, but ranked by repair ratio instead
     # of absolute amount, so a small pipe with a very high ratio still shows
     # up as a top contributor even if its absolute meters are small ---
-    ratio_pareto_df = latest_df[["project_label_qty", "repair_ratio"]].sort_values(
+    ratio_pareto_df = latest_df[["project_label_clean", "qty", "repair_ratio"]].sort_values(
         "repair_ratio", ascending=False
     ).reset_index(drop=True)
     ratio_pareto_df["cumulative_pct"] = (
@@ -973,19 +1026,19 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     ratio_pareto_fig = go.Figure()
     ratio_pareto_fig.add_trace(
         go.Bar(
-            x=ratio_pareto_df["project_label_qty"],
+            x=ratio_pareto_df["project_label_clean"],
             y=ratio_pareto_df["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
             texttemplate="%{y:.1%}",
             textposition="outside",
-            textfont=dict(size=9),
+            textfont=dict(size=10),
             hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
     ratio_pareto_fig.add_trace(
         go.Scatter(
-            x=ratio_pareto_df["project_label_qty"],
+            x=ratio_pareto_df["project_label_clean"],
             y=ratio_pareto_df["cumulative_pct"],
             name="Cumulative %",
             yaxis="y2",
@@ -993,7 +1046,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             mode="lines+markers+text",
             text=ratio_pareto_df["cumulative_pct"].map(lambda v: f"{v:.0f}%"),
             textposition="top center",
-            textfont=dict(size=9, color=COLOR_SECONDARY),
+            textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -1005,9 +1058,12 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
         margin=dict(l=40, r=40, t=50, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hoverlabel=HOVER_STYLE,
-        xaxis=dict(categoryorder="array", categoryarray=ratio_pareto_df["project_label_qty"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=ratio_pareto_df["project_label_clean"].tolist()),
     )
     ratio_pareto_fig.update_xaxes(tickangle=-45)
+    _add_bar_value_annotations(
+        ratio_pareto_fig, ratio_pareto_df["project_label_clean"], ratio_pareto_df["repair_ratio"], ratio_pareto_df["qty"]
+    )
 
     # Production quality/volume matrix (bubble plot) now lives in its own
     # callback (render_bubble_chart) with a view switcher — see below.
@@ -1062,7 +1118,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
                                     {"label": "Plate", "value": "Plate"},
                                     {"label": "Mix (Coil + Plate)", "value": "Mix"},
                                 ],
-                                value=["Coil", "Plate", "Mix"],
+                                value=["Coil", "Mix"],
                                 inline=True,
                             ),
                             dcc.Loading(html.Div(id="type-trend-graph-content")),
@@ -1126,16 +1182,24 @@ def _build_bubble_fig(
     ``x_col``/``total_repair_amount`` are expected to already be converted
     to ``unit`` by the caller — this only formats labels/hover text.
     ``label_col`` is "project_label" for the by-project views, or
-    "dimensions" for the by-dimension view."""
+    "dimensions" for the by-dimension view. The worst (highest-ratio)
+    ``BUBBLE_LABEL_TOP_N`` points also get their name on-chart, not just
+    hover — the rest just show the ratio, to keep the chart readable."""
+    worst_idx = set(df.nlargest(BUBBLE_LABEL_TOP_N, "repair_ratio_pct").index)
+    text_values = [
+        f"{row[label_col]}<br>{row['repair_ratio_pct']:.1f}%" if idx in worst_idx else f"{row['repair_ratio_pct']:.1f}%"
+        for idx, row in df.iterrows()
+    ]
+
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=df[x_col],
             y=df["repair_ratio_pct"],
             mode="markers+text",
-            text=df["repair_ratio_pct"].map(lambda v: f"{v:.1f}%"),
+            text=text_values,
             textposition="top center",
-            textfont=dict(size=9),
+            textfont=dict(size=10),
             customdata=df[label_col],
             marker=dict(
                 size=df["total_repair_amount"],
@@ -1238,14 +1302,15 @@ def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result)
 
 
 def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repair_ratio"):
-    """Straight-line (least-squares) trend over at most the last 30 days of
-    ``series_df`` (date, ``value_col``). With less than 30 days of history —
-    all we have right now — this naturally covers the full range from the
-    first to the last available day."""
+    """Straight-line (least-squares) trend over at most the last
+    ``TREND_WINDOW_DAYS`` days of ``series_df`` (date, ``value_col``) — the
+    same window the chart itself is already limited to by the time this is
+    called, so this is mostly a safety net for callers that pass unwindowed
+    data."""
     windowed = series_df.dropna(subset=["date", value_col]).sort_values("date")
     if windowed.empty:
         return None
-    window_start = windowed["date"].max() - pd.Timedelta(days=30)
+    window_start = windowed["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
     windowed = windowed[windowed["date"] >= window_start]
     if len(windowed) < 2:
         return None
@@ -1272,7 +1337,7 @@ def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repai
 
 
 # ---------------------------------------------------------------------------
-# Callback: Overall Repair Rate Trend — same idea as the production-type
+# Callback: Coil and Plate Repair Rate Trend — same idea as the production-type
 # trend below: a checklist isolates Excl./Incl. Skelp, and a linear trend
 # line is drawn (last 30 days, or the full range if shorter) when only one
 # of the two is selected.
@@ -1293,6 +1358,8 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
     overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
     overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
     overall_ratio["weighted_repair_ratio_incl_skelp"] = overall_ratio["weighted_repair_ratio_incl_skelp"].round(6)
+    window_start = overall_ratio["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
+    overall_ratio = overall_ratio[overall_ratio["date"] >= window_start]
 
     fig = go.Figure()
     if "Excl" in selected_series:
@@ -1305,7 +1372,7 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
                 line=dict(color=COLOR_COIL, width=3),
                 text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="top center",
-                textfont=dict(size=9, color=COLOR_COIL),
+                textfont=dict(size=10, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1319,7 +1386,7 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
                 text=(overall_ratio["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="bottom center",
-                textfont=dict(size=9, color=COLOR_SECONDARY),
+                textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1333,11 +1400,11 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
             fig.add_trace(trend_trace)
 
     if len(selected_series) == 2:
-        title = "Overall Repair Rate Trend (Excl. vs Incl. Skelp)"
+        title = "Coil and Plate Repair Rate Trend (Excl. vs Incl. Skelp)"
     elif selected_series == ["Excl"]:
-        title = "Overall Repair Rate Trend (Excl. Skelp)"
+        title = "Coil and Plate Repair Rate Trend (Excl. Skelp)"
     else:
-        title = "Overall Repair Rate Trend — Skelp-Inclusive Trend"
+        title = "Coil and Plate Repair Rate Trend — Skelp-Inclusive Trend"
 
     fig.update_layout(
         title=title,
@@ -1348,7 +1415,7 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+    fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     return dcc.Graph(figure=fig)
 
@@ -1371,6 +1438,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
         return _empty_state("No data available. Import an Excel file first.")
 
     baseline_df = load_historical_baselines()
+    window_start = master_df["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
     _TYPE_COLORS = {"Coil": COLOR_COIL, "Plate": COLOR_PLATE}
     series_by_type = {}
     fig = go.Figure()
@@ -1382,6 +1450,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
         # left over from the division chain — otherwise a genuinely flat
         # series renders as a jittery line and throws off the trend fit.
         type_trend["weighted_repair_ratio"] = type_trend["weighted_repair_ratio"].round(6)
+        type_trend = type_trend[type_trend["date"] >= window_start]
         series_by_type[p_type] = type_trend
         fig.add_trace(
             go.Scatter(
@@ -1392,13 +1461,14 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
                 line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
                 text=(type_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="top center",
-                textfont=dict(size=9, color=_TYPE_COLORS.get(p_type)),
+                textfont=dict(size=10, color=_TYPE_COLORS.get(p_type)),
                 hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
     if "Mix" in selected_types:
         overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
         overall_ratio["weighted_repair_ratio"] = overall_ratio["weighted_repair_ratio"].round(6)
+        overall_ratio = overall_ratio[overall_ratio["date"] >= window_start]
         series_by_type["Mix"] = overall_ratio
         fig.add_trace(
             go.Scatter(
@@ -1409,7 +1479,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
                 line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
                 text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="bottom center",
-                textfont=dict(size=9, color=COLOR_SECONDARY),
+                textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1442,7 +1512,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+    fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     return dcc.Graph(figure=fig)
 
@@ -1502,6 +1572,8 @@ def render_project_trend(selected_value, selected_series):
     project_df = apply_meter_based_repair_ratios(project_df).sort_values("date")
     project_df["repair_ratio"] = project_df["repair_ratio"].round(6)
     project_df["repair_ratio_incl_skelp"] = project_df["repair_ratio_incl_skelp"].round(6)
+    window_start = project_df["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
+    project_df = project_df[project_df["date"] >= window_start]
 
     fig = go.Figure()
     if "Excl" in selected_series:
@@ -1514,7 +1586,7 @@ def render_project_trend(selected_value, selected_series):
                 line=dict(color=COLOR_COIL, width=3),
                 text=(project_df["repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="top center",
-                textfont=dict(size=9, color=COLOR_COIL),
+                textfont=dict(size=10, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1528,7 +1600,7 @@ def render_project_trend(selected_value, selected_series):
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
                 text=(project_df["repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
                 textposition="bottom center",
-                textfont=dict(size=9, color=COLOR_SECONDARY),
+                textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
             )
         )
@@ -1556,7 +1628,7 @@ def render_project_trend(selected_value, selected_series):
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+    fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     return dcc.Graph(figure=fig)
 
@@ -1685,7 +1757,7 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
         marker_color=COLOR_COIL,
         texttemplate="%{y:.1%}",
         textposition="outside",
-        textfont=dict(size=9),
+        textfont=dict(size=10),
         hovertemplate="Pipe %{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
@@ -1825,13 +1897,15 @@ def render_dimension_detail(selected_dimension):
     if dim_df.empty:
         return _empty_state("No projects found for this dimension on the latest day.")
 
-    # Repair-ratio chart — same "qty instead of the 20XXQ- prefix" label as
-    # the dashboard's ratio charts (Skelp/Pareto Ratio).
-    dim_df["project_label_qty"] = dim_df.apply(
-        lambda r: _project_label_with_qty(r["project_no"], r["dimensions"], r["qty"]), axis=1
+    # Repair-ratio chart — same clean (no 20XXQ- prefix) label as the
+    # dashboard's ratio charts, with qty shown inside the bar instead.
+    dim_df["project_label_clean"] = dim_df.apply(
+        lambda r: _project_label_clean(r["project_no"], r["dimensions"]), axis=1
     )
 
     dim_trend = daily_weighted_repair_ratios_for_dimension(master_df, selected_dimension)
+    dim_window_start = dim_trend["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
+    dim_trend = dim_trend[dim_trend["date"] >= dim_window_start]
     trend_fig = go.Figure()
     trend_fig.add_trace(
         go.Scatter(
@@ -1842,7 +1916,7 @@ def render_dimension_detail(selected_dimension):
             line=dict(color=COLOR_COIL, width=3),
             text=(dim_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
             textposition="top center",
-            textfont=dict(size=9, color=COLOR_COIL),
+            textfont=dict(size=10, color=COLOR_COIL),
             hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -1855,7 +1929,7 @@ def render_dimension_detail(selected_dimension):
             line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
             text=(dim_trend["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
             textposition="bottom center",
-            textfont=dict(size=9, color=COLOR_SECONDARY),
+            textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
         )
     )
@@ -1867,25 +1941,26 @@ def render_dimension_detail(selected_dimension):
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    trend_fig.update_xaxes(tickformat="%d.%m.%Y", dtick="D1")
+    trend_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     fig = px.bar(
         dim_df,
-        x="project_label_qty",
+        x="project_label_clean",
         y="repair_ratio",
-        labels={"project_label_qty": "Project", "repair_ratio": "Repair Ratio"},
+        labels={"project_label_clean": "Project", "repair_ratio": "Repair Ratio"},
         title=f"Projects with Dimension {selected_dimension} (Latest Day)",
     )
     fig.update_traces(
         marker_color=COLOR_COIL,
         texttemplate="%{y:.1%}",
         textposition="outside",
-        textfont=dict(size=10),
+        textfont=dict(size=11),
         hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
     )
     fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
     fig.update_xaxes(tickangle=-45)
     fig.update_yaxes(tickformat=".1%")
+    _add_bar_value_annotations(fig, dim_df["project_label_clean"], dim_df["repair_ratio"], dim_df["qty"])
 
     table_columns = ["project_no", "production_type", "qty", "project_status", "repair_ratio"]
     table = dash_table.DataTable(
