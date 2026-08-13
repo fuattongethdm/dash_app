@@ -20,9 +20,14 @@ create table if not exists repair_rates (
     unique (date, project_no, dimensions)
 );
 
+-- One row per physical pipe (project_sheet + block_cell identifies the
+-- pipe's stable Excel repair-record slot), not one row per pipe per day —
+-- first_seen_date is set once (the day the pipe was repaired) and never
+-- overwritten on re-upload; last_updated_date refreshes on every re-upload.
 create table if not exists pipe_repair_details (
     id bigint generated always as identity primary key,
-    date date not null,
+    first_seen_date date not null,
+    last_updated_date date not null,
     project_sheet text not null,
     block_cell text not null,
     pipe_no integer not null,
@@ -32,7 +37,7 @@ create table if not exists pipe_repair_details (
     repair_count integer,
     repair_category text not null,
     surface_state text not null,
-    unique (date, project_sheet, block_cell)
+    unique (project_sheet, block_cell)
 );
 
 create table if not exists project_group_configs (

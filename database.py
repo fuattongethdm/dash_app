@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS historical_baselines (
 PIPE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pipe_repair_details (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
+    first_seen_date TEXT NOT NULL,
+    last_updated_date TEXT NOT NULL,
     project_sheet TEXT NOT NULL,
     block_cell TEXT NOT NULL,
     pipe_no INTEGER NOT NULL,
@@ -70,7 +71,7 @@ CREATE TABLE IF NOT EXISTS pipe_repair_details (
     repair_count INTEGER,
     repair_category TEXT NOT NULL,
     surface_state TEXT NOT NULL,
-    UNIQUE(date, project_sheet, block_cell)
+    UNIQUE(project_sheet, block_cell)
 );
 """
 
@@ -143,13 +144,16 @@ ON CONFLICT(project_no, dimensions) DO UPDATE SET
 
 PIPE_UPSERT_SQL = """
 INSERT INTO pipe_repair_details (
-    date, project_sheet, block_cell, pipe_no, pipe_length_ft, repair_amount,
-    repair_ratio, repair_count, repair_category, surface_state
+    first_seen_date, last_updated_date, project_sheet, block_cell, pipe_no,
+    pipe_length_ft, repair_amount, repair_ratio, repair_count, repair_category,
+    surface_state
 ) VALUES (
-    :date, :project_sheet, :block_cell, :pipe_no, :pipe_length_ft, :repair_amount,
-    :repair_ratio, :repair_count, :repair_category, :surface_state
+    :first_seen_date, :last_updated_date, :project_sheet, :block_cell, :pipe_no,
+    :pipe_length_ft, :repair_amount, :repair_ratio, :repair_count, :repair_category,
+    :surface_state
 )
-ON CONFLICT(date, project_sheet, block_cell) DO UPDATE SET
+ON CONFLICT(project_sheet, block_cell) DO UPDATE SET
+    last_updated_date = excluded.last_updated_date,
     pipe_no = excluded.pipe_no,
     pipe_length_ft = excluded.pipe_length_ft,
     repair_amount = excluded.repair_amount,
@@ -498,8 +502,17 @@ def load_historical_baselines(conn: sqlite3.Connection | None = None) -> pd.Data
 
 
 def _pipe_records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Build upsert-ready records from a freshly-parsed pipe_df (which only
+    carries a single ``date`` — the day of this upload). Both
+    ``first_seen_date`` and ``last_updated_date`` default to that date here;
+    for a pipe that already exists, the caller (upsert_pipe_repair_details)
+    overrides ``first_seen_date`` with its real, original value before
+    writing, so a pipe's repair date never changes on re-upload."""
     write_df = df.drop(columns=["id"], errors="ignore").copy()
-    write_df["date"] = pd.to_datetime(write_df["date"]).dt.strftime("%Y-%m-%d")
+    upload_date = pd.to_datetime(write_df["date"]).dt.strftime("%Y-%m-%d")
+    write_df["first_seen_date"] = upload_date
+    write_df["last_updated_date"] = upload_date
+    write_df = write_df.drop(columns=["date"])
     records = write_df.astype(object).where(pd.notna(write_df), None).to_dict(orient="records")
     for record in records:
         record["pipe_no"] = int(record["pipe_no"])
@@ -578,6 +591,37 @@ def load_master_data(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     return df
 
 
+def _existing_pipe_first_seen() -> dict[tuple[str, str], str]:
+    """(project_sheet, block_cell) -> first_seen_date for every pipe already
+    on file — the whole table, no date filter, since the table is now
+    bounded to one row per physical pipe rather than one per pipe per day.
+    Supabase-only: PostgREST's upsert can't "update every column except
+    one," so the caller uses this to preserve a pipe's original
+    first_seen_date in Python before re-upserting it. SQLite's
+    ON CONFLICT ... DO UPDATE already leaves first_seen_date untouched
+    natively, so it doesn't need this lookup."""
+    client = _get_supabase_client()
+    rows: list[dict[str, Any]] = []
+    page_size = 1000
+    try:
+        for start in range(0, 100_000, page_size):
+            response = _execute_with_retry(
+                client.table(PIPE_TABLE_NAME)
+                .select("project_sheet,block_cell,first_seen_date")
+                .order("project_sheet")
+                .order("block_cell")
+                .range(start, start + page_size - 1)
+            )
+            rows.extend(response.data)
+            if len(response.data) < page_size:
+                break
+    except Exception as exc:
+        if PIPE_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
+            return {}
+        raise
+    return {(row["project_sheet"], row["block_cell"]): row["first_seen_date"] for row in rows}
+
+
 def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None = None) -> int:
     if df.empty:
         return 0
@@ -585,12 +629,17 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
+        existing_first_seen = _existing_pipe_first_seen()
+        for record in records:
+            key = (record["project_sheet"], record["block_cell"])
+            if key in existing_first_seen:
+                record["first_seen_date"] = existing_first_seen[key]
         for start in range(0, len(records), 500):
             batch = records[start : start + 500]
             _execute_with_retry(
                 client.table(PIPE_TABLE_NAME).upsert(
                     batch,
-                    on_conflict="date,project_sheet,block_cell",
+                    on_conflict="project_sheet,block_cell",
                 )
             )
         _cache_invalidate(PIPE_TABLE_NAME)
@@ -621,7 +670,13 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
                 response = _execute_with_retry(
                     client.table(PIPE_TABLE_NAME)
                     .select("*")
-                    .order("date")
+                    # order() must be a fully-unique key for .range() paging to be
+                    # stable — first_seen_date alone has heavy ties (many pipes
+                    # share a date), which made range() return some rows twice
+                    # and skip others. (project_sheet, block_cell) matches the
+                    # table's own UNIQUE constraint.
+                    .order("project_sheet")
+                    .order("block_cell")
                     .range(start, start + page_size - 1)
                 )
                 rows.extend(response.data)
@@ -638,7 +693,9 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
         should_close = conn is None
         conn = conn or get_connection()
         init_db(conn)
-        df = pd.read_sql_query("SELECT * FROM pipe_repair_details ORDER BY date, project_sheet, pipe_no", conn)
+        df = pd.read_sql_query(
+            "SELECT * FROM pipe_repair_details ORDER BY first_seen_date, project_sheet, pipe_no", conn
+        )
         if should_close:
             conn.close()
 
@@ -648,6 +705,8 @@ def load_pipe_repair_details(conn: sqlite3.Connection | None = None) -> pd.DataF
 
 
 def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    """Pipes whose first_seen_date (i.e. the day they were repaired) is
+    ``selected_date``. Not called anywhere yet, kept for future callers."""
     date_text = pd.to_datetime(selected_date).date().isoformat()
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
@@ -658,8 +717,9 @@ def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | 
                 response = _execute_with_retry(
                     client.table(PIPE_TABLE_NAME)
                     .select("*")
-                    .eq("date", date_text)
+                    .eq("first_seen_date", date_text)
                     .order("project_sheet")
+                    .order("block_cell")
                     .range(start, start + page_size - 1)
                 )
                 rows.extend(response.data)
@@ -675,7 +735,7 @@ def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | 
     conn = conn or get_connection()
     init_db(conn)
     df = pd.read_sql_query(
-        "SELECT * FROM pipe_repair_details WHERE date = ? ORDER BY project_sheet, pipe_no",
+        "SELECT * FROM pipe_repair_details WHERE first_seen_date = ? ORDER BY project_sheet, pipe_no",
         conn,
         params=(date_text,),
     )
@@ -686,10 +746,13 @@ def load_pipe_repair_details_for_date(selected_date, conn: sqlite3.Connection | 
 
 def _normalize_pipe_repair_details(df: pd.DataFrame) -> pd.DataFrame:
     if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
+        df["first_seen_date"] = pd.to_datetime(df["first_seen_date"])
+        df["last_updated_date"] = pd.to_datetime(df["last_updated_date"])
         placeholder_mask = pd.to_numeric(df["repair_amount"], errors="coerce").le(0.0001)
         df.loc[placeholder_mask, ["repair_amount", "repair_ratio"]] = 0.0
-        sort_columns = [column for column in ["date", "project_sheet", "pipe_no"] if column in df.columns]
+        sort_columns = [
+            column for column in ["first_seen_date", "project_sheet", "pipe_no"] if column in df.columns
+        ]
         if sort_columns:
             df = df.sort_values(sort_columns).reset_index(drop=True)
     return df

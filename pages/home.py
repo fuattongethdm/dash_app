@@ -1654,7 +1654,7 @@ def load_pipe_dates(_id, _import_result):
     df = load_pipe_repair_details()
     if df.empty:
         return [], None
-    dates = sorted(df["date"].dt.date.unique(), reverse=True)
+    dates = sorted(df["first_seen_date"].dt.date.unique(), reverse=True)
     options = [{"label": d.strftime("%d.%m.%Y"), "value": d.isoformat()} for d in dates]
     return options, options[0]["value"]
 
@@ -1679,16 +1679,18 @@ def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
 @callback(
     Output("pipe-sheet-dropdown", "options"),
     Output("pipe-sheet-dropdown", "value"),
-    Input("pipe-date-dropdown", "value"),
+    Input("pipe-sheet-dropdown", "id"),  # fires once, on page load
+    Input("import-confirm-result", "children"),  # refresh after a new import
 )
-def load_pipe_sheets(selected_date):
-    if not selected_date:
-        return [], None
+def load_pipe_sheets(_id, _import_result):
+    """pipe_repair_details is a current-state table (one row per physical
+    pipe — see upsert_pipe_repair_details), so the sheet list is no longer
+    scoped to a date; every mapped sheet with any current pipe shows up
+    regardless of which date is picked above."""
     df = load_pipe_repair_details()
     if df.empty:
         return [], None
-    day_df = df[df["date"].dt.date.astype(str) == selected_date]
-    sheets = set(day_df["project_sheet"].unique())
+    sheets = set(df["project_sheet"].unique())
     # Only sheets with a confirmed project mapping show up here — the raw
     # Excel sheet name isn't meaningful to look at directly, and mixing
     # mapped/unmapped entries in one dropdown was confusing.
@@ -1713,22 +1715,28 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
     if not selected_date:
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
+    # pipe_repair_details is a current-state table (one row per physical
+    # pipe, kept up to date on every import — see upsert_pipe_repair_details)
+    # rather than a daily snapshot, so "All Projects — Summary" and the
+    # per-sheet drill-down below always reflect every pipe's latest known
+    # state, regardless of which date is selected. Only "Pipes Repaired on
+    # This Date" (added_df, below) is scoped to the selected date.
     df = load_pipe_repair_details()
-    day_df = df[df["date"].dt.date.astype(str) == selected_date]
 
     # Only show sheets with a confirmed project mapping — the raw Excel
     # sheet name on its own isn't meaningful here (see the
     # feature/project-sheet-mapping-tool branch for how mappings are made).
-    label_map = _pipe_sheet_label_map(load_project_sheet_links())
-    mapped_day_df = day_df[day_df["project_sheet"].isin(label_map)]
+    links_df = load_project_sheet_links()
+    label_map = _pipe_sheet_label_map(links_df)
+    mapped_df = df[df["project_sheet"].isin(label_map)]
 
-    if mapped_day_df.empty:
+    if mapped_df.empty:
         return _empty_state(
-            "No mapped projects for this date yet. Check out the "
+            "No mapped projects yet. Check out the "
             "feature/project-sheet-mapping-tool branch to link sheets first."
         )
 
-    summary_table = summarize_pipe_totals_by_sheet(mapped_day_df).rename(columns={"project_sheet": "project"})
+    summary_table = summarize_pipe_totals_by_sheet(mapped_df).rename(columns={"project_sheet": "project"})
     summary_table["project"] = summary_table["project"].map(label_map)
     summary_columns = list(summary_table.columns)
     summary_section = html.Div(
@@ -1747,11 +1755,45 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
         ]
     )
 
+    # A pipe's first_seen_date is the day it was repaired, so this is the
+    # flat "what's new" list for the selected date, across all sheets —
+    # independent of the single-sheet drill-down below.
+    day_df = mapped_df[mapped_df["first_seen_date"].dt.date.astype(str) == selected_date]
+    confirmed_links = links_df[links_df["status"] == "confirmed"][["project_sheet", "project_no", "dimensions"]]
+    added_df = day_df.merge(confirmed_links, on="project_sheet", how="left").copy()
+    if "repair_amount" in added_df.columns:
+        added_df["repair_amount"] = amount_in_display_unit(added_df["repair_amount"], selected_unit)
+    added_columns = ["project_no", "dimensions", "pipe_no", "repair_amount", "repair_ratio"]
+    added_df = added_df[added_columns].sort_values(["project_no", "pipe_no"])
+    added_section = html.Div(
+        [
+            html.H3("Pipes Repaired on This Date"),
+            dash_table.DataTable(
+                data=_table_records(added_df, added_columns),
+                columns=_table_columns(
+                    added_columns,
+                    label_overrides={
+                        "project_no": "Project",
+                        "pipe_no": "Pipe No.",
+                        "repair_amount": f"Repair Amount ({u})",
+                    },
+                ),
+                page_size=15,
+                sort_action="native",
+                filter_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell=TABLE_CELL_STYLE,
+                style_header=TABLE_HEADER_STYLE,
+                style_data_conditional=TABLE_CONDITIONAL_STYLE,
+            ),
+        ]
+    )
+
     if not selected_sheet:
-        return summary_section
+        return html.Div([summary_section, added_section])
 
     sheet_label = label_map.get(selected_sheet, selected_sheet)
-    sheet_df = day_df[day_df["project_sheet"] == selected_sheet].sort_values("pipe_no")
+    sheet_df = mapped_df[mapped_df["project_sheet"] == selected_sheet].sort_values("pipe_no")
 
     worst_fig = px.bar(
         worst_pipes(sheet_df, top_n=15),
@@ -1777,7 +1819,11 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
     if "repair_amount" in sheet_df.columns:
         sheet_df["repair_amount"] = amount_in_display_unit(sheet_df["repair_amount"], selected_unit)
 
-    detail_columns = [c for c in sheet_df.columns if c not in ("date", "surface_state", "repair_category", "project_sheet")]
+    detail_columns = [
+        c
+        for c in sheet_df.columns
+        if c not in ("first_seen_date", "last_updated_date", "surface_state", "repair_category", "project_sheet")
+    ]
     detail_table = dash_table.DataTable(
         data=_table_records(sheet_df, detail_columns),
         columns=_table_columns(
@@ -1796,6 +1842,7 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
     return html.Div(
         [
             summary_section,
+            added_section,
             html.H3(f"{sheet_label} — Pipe Details"),
             dcc.Graph(figure=worst_fig),
             detail_table,
