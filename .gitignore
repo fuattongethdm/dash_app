@@ -9,4 +9,5 @@ data/
 *.db
 *.xlsx
 *.pdf
+*.md
 .DS_Store
