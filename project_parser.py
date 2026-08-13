@@ -42,6 +42,13 @@ _LENGTH_DECIMAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ft\b", re.IGNORECASE)
 
 PIPE_NO_ROW_OFFSET = 4
 DATA_ROW_OFFSET = 5
+# A newer, more compact block template (seen first on the "06-131" pier/
+# stage-style sheets) uses the same columns but a shorter block: pipe
+# no./length two rows below the anchor, amount/count/state three rows
+# below, instead of four/five. Tried only as a fallback (see _parse_sheet)
+# so sheets that already match the standard offsets are unaffected.
+PIPE_NO_ROW_OFFSET_COMPACT = 2
+DATA_ROW_OFFSET_COMPACT = 3
 
 
 @dataclass
@@ -94,6 +101,27 @@ def _load_sheet_grid(ws) -> dict[tuple[int, int], object]:
     return grid
 
 
+def _extract_block(
+    grid: dict[tuple[int, int], object], anchor_row: int, anchor_col: int, pipe_no_offset: int, data_offset: int
+) -> tuple[float, float | None, float, float | None, str | None] | None:
+    """Try to pull pipe_no/length/amount/count/surface_state out of a block
+    using the given row offsets. Returns None if pipe_no or repair_amount
+    is missing at these offsets (either a genuinely unused template slot,
+    or the wrong offset pair for this sheet's template)."""
+    pipe_no_row = anchor_row + pipe_no_offset
+    data_row = anchor_row + data_offset
+
+    pipe_no = coerce_number(grid.get((pipe_no_row, anchor_col + 1)))
+    repair_amount = coerce_number(grid.get((data_row, anchor_col + 1)))
+    if pipe_no is None or repair_amount is None:
+        return None
+
+    pipe_length_ft = _parse_length_ft(grid.get((pipe_no_row, anchor_col)))
+    repair_count = coerce_number(grid.get((data_row, anchor_col + 3)))
+    surface_state = normalize_spaces(grid.get((data_row, anchor_col + 4)))
+    return pipe_no, pipe_length_ft, repair_amount, repair_count, surface_state
+
+
 def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParseReport) -> list[dict]:
     grid = _load_sheet_grid(ws)
     anchors = [pos for pos, value in grid.items() if _is_label_cell(value)]
@@ -110,19 +138,16 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
         else:
             continue  # unused template slot, not an actual pipe entry
 
-        pipe_no_row = anchor_row + PIPE_NO_ROW_OFFSET
-        data_row = anchor_row + DATA_ROW_OFFSET
-
-        pipe_no = coerce_number(grid.get((pipe_no_row, anchor_col + 1)))
-        repair_amount = coerce_number(grid.get((data_row, anchor_col + 1)))
-
-        if pipe_no is None or repair_amount is None:
+        extracted = _extract_block(grid, anchor_row, anchor_col, PIPE_NO_ROW_OFFSET, DATA_ROW_OFFSET)
+        if extracted is None:
+            extracted = _extract_block(
+                grid, anchor_row, anchor_col, PIPE_NO_ROW_OFFSET_COMPACT, DATA_ROW_OFFSET_COMPACT
+            )
+        if extracted is None:
             report.skipped_blocks += 1
             continue
 
-        pipe_length_ft = _parse_length_ft(grid.get((pipe_no_row, anchor_col)))
-        repair_count = coerce_number(grid.get((data_row, anchor_col + 3)))
-        surface_state = normalize_spaces(grid.get((data_row, anchor_col + 4)))
+        pipe_no, pipe_length_ft, repair_amount, repair_count, surface_state = extracted
 
         rows.append(
             {
