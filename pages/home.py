@@ -831,7 +831,22 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     # --- Skelp impact: how much "incl. skelp" adds on top of the base ratio ---
     skelp_df = latest_df[["project_label", "project_label_clean", "qty", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
     skelp_df["skelp_impact"] = (skelp_df["repair_ratio_incl_skelp"] - skelp_df["repair_ratio"]).round(6)
-    skelp_top = skelp_df.sort_values("skelp_impact", ascending=False).head(10)
+    skelp_top = skelp_df.sort_values("repair_ratio", ascending=False).head(5)
+    # A stacked segment that's small relative to the tallest bar can't fit
+    # its two-line "value / Qty N" label without overlapping the segment
+    # next to it — below a min-fraction-of-max threshold (same heuristic as
+    # _add_bar_value_annotations / the PDF version of this chart) the label
+    # moves outside the bar (an annotation above the stack) instead of
+    # being drawn inside it.
+    ratio_max_stack = (skelp_top["repair_ratio"] + skelp_top["skelp_impact"]).max() if len(skelp_top) else 0
+    skelp_base_text = [
+        f"{r:.2%}<br>Qty {q}" if ratio_max_stack and r >= ratio_max_stack * 0.1 else ""
+        for r, q in zip(skelp_top["repair_ratio"], skelp_top["qty"])
+    ]
+    skelp_impact_text = [
+        f"+{imp:.2%}" if ratio_max_stack and imp >= ratio_max_stack * 0.08 else ""
+        for imp in skelp_top["skelp_impact"]
+    ]
     skelp_fig = go.Figure()
     skelp_fig.add_trace(
         go.Bar(
@@ -839,15 +854,9 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             y=skelp_top["repair_ratio"],
             name="Repair Ratio",
             marker_color=COLOR_COIL,
-            # Qty is folded into the same texttemplate (rather than a
-            # separate _add_bar_value_annotations overlay like the other
-            # ratio charts) — an annotation at the same inside-center point
-            # as this segment's own text would sit on top of it and hide
-            # the ratio percentage.
-            texttemplate="%{y:.2%}<br>Qty %{customdata}",
+            text=skelp_base_text,
             textposition="inside",
             textfont=dict(size=11, color="white"),
-            customdata=skelp_top["qty"],
             hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
         )
     )
@@ -857,29 +866,56 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             y=skelp_top["skelp_impact"],
             name="Skelp Impact",
             marker_color=COLOR_SECONDARY,
-            texttemplate="+%{y:.2%}",
+            text=skelp_impact_text,
             textposition="inside",
             textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2%}</b><extra></extra>",
         )
     )
+    for label, r, imp, q, base_t, impact_t in zip(
+        skelp_top["project_label_clean"],
+        skelp_top["repair_ratio"],
+        skelp_top["skelp_impact"],
+        skelp_top["qty"],
+        skelp_base_text,
+        skelp_impact_text,
+    ):
+        # Impact line first, repair-ratio line last, so the text block reads
+        # top-to-bottom in the same order the bar stacks bottom-to-top:
+        # Repair Ratio (base, bottom of stack) ends up closest to the bar.
+        lines = []
+        if not impact_t:
+            lines.append(f"+{imp:.2%}")
+        if not base_t:
+            lines.append(f"{r:.2%} (Qty {q})")
+        if lines:
+            skelp_fig.add_annotation(
+                x=label,
+                y=r + imp,
+                text="<br>".join(lines),
+                showarrow=False,
+                yshift=14,
+                font=dict(size=9, color="#1e293b"),
+            )
     skelp_fig.update_layout(
         barmode="stack",
-        title="Skelp-End Weld Impact on Repair Ratio (Top 10, Latest Day)",
+        title="Skelp-End Weld Impact on Repair Ratio (Top 5, Latest Day)",
         yaxis_title="Repair Ratio",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
         xaxis=dict(categoryorder="array", categoryarray=skelp_top["project_label_clean"].tolist()),
     )
-    skelp_fig.update_xaxes(tickangle=-45)
+    skelp_fig.update_xaxes(tickangle=-25)
     skelp_fig.update_yaxes(tickformat=".2%")
 
     # --- Skelp impact: same as above, but on the repair amount itself
-    # rather than the ratio, and ranked by its own metric (skelp_impact_amount)
-    # instead of reusing the ratio chart's top 10 — the two charts can show
+    # rather than the ratio, and ranked by its own metric (total_repair_amount)
+    # instead of reusing the ratio chart's top 5 — the two charts can show
     # different projects.
-    skelp_amount_df = latest_df[["project_label", "total_repair_amount", "total_repair_amount_incl_skelp"]].copy()
+    skelp_amount_df = latest_df[
+        ["project_label_clean", "qty", "total_repair_amount", "total_repair_amount_incl_skelp"]
+    ].copy()
     skelp_amount_df["total_repair_amount"] = amount_in_display_unit(skelp_amount_df["total_repair_amount"], selected_unit)
     skelp_amount_df["total_repair_amount_incl_skelp"] = amount_in_display_unit(
         skelp_amount_df["total_repair_amount_incl_skelp"], selected_unit
@@ -887,19 +923,34 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     skelp_amount_df["skelp_impact_amount"] = (
         skelp_amount_df["total_repair_amount_incl_skelp"] - skelp_amount_df["total_repair_amount"]
     ).round(4)
-    skelp_amount_top = skelp_amount_df.sort_values("skelp_impact_amount", ascending=False).head(10)
+    skelp_amount_top = skelp_amount_df.sort_values("total_repair_amount", ascending=False).head(5)
     skelp_amount_top["pct_increase"] = (
         skelp_amount_top["skelp_impact_amount"]
         / skelp_amount_top["total_repair_amount"].where(skelp_amount_top["total_repair_amount"] != 0)
     ).fillna(0) * 100
+    # Same "move the label outside the bar if the segment's too small to
+    # fit it" rule as the ratio chart above.
+    amount_max_stack = (
+        (skelp_amount_top["total_repair_amount"] + skelp_amount_top["skelp_impact_amount"]).max()
+        if len(skelp_amount_top)
+        else 0
+    )
+    amount_base_text = [
+        f"{v:.2f}<br>Qty {q}" if amount_max_stack and v >= amount_max_stack * 0.1 else ""
+        for v, q in zip(skelp_amount_top["total_repair_amount"], skelp_amount_top["qty"])
+    ]
+    amount_impact_text = [
+        f"+{imp:.2f}" if amount_max_stack and imp >= amount_max_stack * 0.08 else ""
+        for imp in skelp_amount_top["skelp_impact_amount"]
+    ]
     skelp_amount_fig = go.Figure()
     skelp_amount_fig.add_trace(
         go.Bar(
-            x=skelp_amount_top["project_label"],
+            x=skelp_amount_top["project_label_clean"],
             y=skelp_amount_top["total_repair_amount"],
             name=f"Repair Amount ({u})",
             marker_color=COLOR_COIL,
-            texttemplate="%{y:.2f}",
+            text=amount_base_text,
             textposition="inside",
             textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Repair Amount: <b>%{y:.2f} " + u + "</b><extra></extra>",
@@ -907,27 +958,50 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     )
     skelp_amount_fig.add_trace(
         go.Bar(
-            x=skelp_amount_top["project_label"],
+            x=skelp_amount_top["project_label_clean"],
             y=skelp_amount_top["skelp_impact_amount"],
             name=f"Skelp Impact ({u})",
             marker_color=COLOR_SECONDARY,
             customdata=skelp_amount_top["pct_increase"],
-            texttemplate="+%{y:.2f}",
+            text=amount_impact_text,
             textposition="inside",
             textfont=dict(size=11, color="white"),
             hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2f} " + u + "</b> (+%{customdata:.2f}%)<extra></extra>",
         )
     )
+    for label, v, imp, q, base_t, impact_t in zip(
+        skelp_amount_top["project_label_clean"],
+        skelp_amount_top["total_repair_amount"],
+        skelp_amount_top["skelp_impact_amount"],
+        skelp_amount_top["qty"],
+        amount_base_text,
+        amount_impact_text,
+    ):
+        # Impact line first, repair-amount line last — see skelp_fig above.
+        lines = []
+        if not impact_t:
+            lines.append(f"+{imp:.2f}")
+        if not base_t:
+            lines.append(f"{v:.2f} (Qty {q})")
+        if lines:
+            skelp_amount_fig.add_annotation(
+                x=label,
+                y=v + imp,
+                text="<br>".join(lines),
+                showarrow=False,
+                yshift=14,
+                font=dict(size=9, color="#1e293b"),
+            )
     skelp_amount_fig.update_layout(
         barmode="stack",
-        title=f"Skelp-End Weld Impact on Repair Amount ({u}, Top 10, Latest Day)",
+        title=f"Skelp-End Weld Impact on Repair Amount ({u}, Top 5, Latest Day)",
         yaxis_title=f"Repair Amount ({u})",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=80),
         hoverlabel=HOVER_STYLE,
-        xaxis=dict(categoryorder="array", categoryarray=skelp_amount_top["project_label"].tolist()),
+        xaxis=dict(categoryorder="array", categoryarray=skelp_amount_top["project_label_clean"].tolist()),
     )
-    skelp_amount_fig.update_xaxes(tickangle=-45)
+    skelp_amount_fig.update_xaxes(tickangle=-25)
 
     # --- Repair amount by dimension (data only — still feeds the weighted-
     # ratio-by-dimension chart below; its own chart slot now shows the
@@ -1181,14 +1255,15 @@ def _build_bubble_fig(
     x_label: str,
     title: str,
     unit: str,
-    label_col: str = "project_label",
+    label_col: str = "project_label_clean",
 ) -> go.Figure:
     """Bubble plot: X = ``x_col``, Y = repair_ratio_pct, size = repair
     amount, color = repair_ratio_pct on a yellow-to-red scale. ``df``'s
     ``x_col``/``total_repair_amount`` are expected to already be converted
     to ``unit`` by the caller — this only formats labels/hover text.
-    ``label_col`` is "project_label" for the by-project views, or
-    "dimensions" for the by-dimension view. The worst (highest-ratio)
+    ``label_col`` is "project_label_clean" (no "20XXQ-" prefix) for the
+    by-project views, or "dimensions" for the by-dimension view. The worst
+    (highest-ratio)
     ``BUBBLE_LABEL_TOP_N`` points also get their name on-chart, not just
     hover — the rest just show the ratio, to keep the chart readable."""
     worst_idx = set(df.nlargest(BUBBLE_LABEL_TOP_N, "repair_ratio_pct").index)
@@ -1280,7 +1355,13 @@ def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result)
         return dcc.Graph(figure=fig)
 
     bubble_df = latest_df[
-        ["project_label", "project_total_pipe_length", "repaired_spiral_length", "repair_ratio", "total_repair_amount"]
+        [
+            "project_label_clean",
+            "project_total_pipe_length",
+            "repaired_spiral_length",
+            "repair_ratio",
+            "total_repair_amount",
+        ]
     ].copy()
     bubble_df["repair_ratio_pct"] = (bubble_df["repair_ratio"] * 100).round(4)
     bubble_df["project_total_pipe_length"] = length_in_display_unit(bubble_df["project_total_pipe_length"], selected_unit)

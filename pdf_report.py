@@ -121,9 +121,9 @@ def _style_axes(ax, title: str) -> None:
         ax.spines[spine].set_visible(False)
 
 
-def _project_x_labels(ax, labels: pd.Series) -> None:
+def _project_x_labels(ax, labels: pd.Series, rotation: int = 45) -> None:
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xticklabels(labels, rotation=rotation, ha="right", fontsize=8)
 
 
 def _date_axis(ax) -> None:
@@ -249,21 +249,25 @@ def _worst_projects_chart(latest_df: pd.DataFrame) -> Image:
 
 
 def _skelp_impact_charts(latest_df: pd.DataFrame, unit: str) -> tuple[Image, Image]:
-    """Ratio and amount charts each rank their own top 10 by their own
-    metric — mirrors the dashboard's skelp-impact pair (pages/home.py,
-    render_dashboard). The ratio chart drops the "20XXQ-" project prefix
-    and shows pipe quantity inside the bar, same as the dashboard's
-    repair-ratio charts; the amount chart keeps the plain project label."""
+    """Ratio and amount charts each rank their own top 5 by their own base
+    metric (repair_ratio / total_repair_amount) — mirrors the dashboard's
+    skelp-impact pair (pages/home.py, render_dashboard). The ratio chart
+    drops the "20XXQ-" project prefix and shows pipe quantity inside the
+    bar, same as the dashboard's repair-ratio charts; the amount chart
+    keeps the plain project label."""
     ratio_df = latest_df[["project_label", "project_no", "dimensions", "qty", "repair_ratio", "repair_ratio_incl_skelp"]].copy()
     ratio_df["skelp_impact"] = (ratio_df["repair_ratio_incl_skelp"] - ratio_df["repair_ratio"]).round(6)
-    ratio_top = ratio_df.sort_values("skelp_impact", ascending=False).head(10).reset_index(drop=True)
+    ratio_top = ratio_df.sort_values("repair_ratio", ascending=False).head(5).reset_index(drop=True)
     ratio_labels = ratio_top["project_no"].map(_strip_quarter_prefix) + " (" + ratio_top["dimensions"].astype(str) + ")"
 
-    amount_df = latest_df[["project_label", "total_repair_amount", "total_repair_amount_incl_skelp"]].copy()
+    amount_df = latest_df[
+        ["project_no", "dimensions", "qty", "total_repair_amount", "total_repair_amount_incl_skelp"]
+    ].copy()
     amount_df["skelp_impact_amount"] = (
         amount_df["total_repair_amount_incl_skelp"] - amount_df["total_repair_amount"]
     ).round(4)
-    amount_top = amount_df.sort_values("skelp_impact_amount", ascending=False).head(10).reset_index(drop=True)
+    amount_top = amount_df.sort_values("total_repair_amount", ascending=False).head(5).reset_index(drop=True)
+    amount_labels = amount_top["project_no"].map(_strip_quarter_prefix) + " (" + amount_top["dimensions"].astype(str) + ")"
 
     fig1, ax1 = plt.subplots(figsize=(7, 4.2))
     x = range(len(ratio_top))
@@ -271,21 +275,35 @@ def _skelp_impact_charts(latest_df: pd.DataFrame, unit: str) -> tuple[Image, Ima
     impact_pct = ratio_top["skelp_impact"] * 100
     ax1.bar(x, ratio_pct, color=_ACCENT, label="Repair Ratio")
     ax1.bar(x, impact_pct, bottom=ratio_pct, color=_ACCENT2, label="Skelp Impact")
-    _project_x_labels(ax1, ratio_labels)
+    _project_x_labels(ax1, ratio_labels, rotation=25)
     ax1.set_ylabel("Repair Ratio (%)")
     ax1.legend(fontsize=9, frameon=False)
-    _style_axes(ax1, "Skelp-End Weld Impact on Repair Ratio (Top 10, Latest Day)")
+    _style_axes(ax1, "Skelp-End Weld Impact on Repair Ratio (Top 5, Latest Day)")
     fig1.tight_layout()
     # Ratio % and qty share the base segment's center — combined into one
     # two-line label instead of a separate overlapping annotation, same fix
-    # as the dashboard's skelp_fig (pages/home.py).
+    # as the dashboard's skelp_fig (pages/home.py). A segment too small to
+    # fit its label gets it written above the bar instead of omitted.
     max_stack = (ratio_pct + impact_pct).max() if len(ratio_pct) else 0
-    for xi, r, qty in zip(x, ratio_pct, ratio_top["qty"]):
-        if r >= max_stack * 0.1:
+    for xi, r, imp, qty in zip(x, ratio_pct, impact_pct, ratio_top["qty"]):
+        base_fits = r >= max_stack * 0.1
+        impact_fits = imp >= max_stack * 0.08
+        if base_fits:
             ax1.text(xi, r / 2, f"{r:.2f}%\nQty {qty}", ha="center", va="center", color="white", fontsize=7.5)
-    for xi, r, imp in zip(x, ratio_pct, impact_pct):
-        if imp >= max_stack * 0.08:
+        if impact_fits:
             ax1.text(xi, r + imp / 2, f"+{imp:.2f}%", ha="center", va="center", color="white", fontsize=8)
+        # Impact line first, repair-ratio line last, so the text block reads
+        # top-to-bottom in the same order the bar stacks bottom-to-top.
+        outside_lines = []
+        if not impact_fits:
+            outside_lines.append(f"+{imp:.2f}%")
+        if not base_fits:
+            outside_lines.append(f"{r:.2f}% (Qty {qty})")
+        if outside_lines:
+            ax1.text(
+                xi, r + imp + max_stack * 0.02, "\n".join(outside_lines),
+                ha="center", va="bottom", color="#1e293b", fontsize=7,
+            )
     ratio_img = _figure_to_image(fig1, _HALF_WIDTH)
 
     fig2, ax2 = plt.subplots(figsize=(7, 4.2))
@@ -298,11 +316,34 @@ def _skelp_impact_charts(latest_df: pd.DataFrame, unit: str) -> tuple[Image, Ima
         color=_ACCENT2,
         label=f"Skelp Impact ({unit})",
     )
-    _project_x_labels(ax2, amount_top["project_label"])
+    _project_x_labels(ax2, amount_labels, rotation=25)
     ax2.set_ylabel(f"Repair Amount ({unit})")
     ax2.legend(fontsize=9, frameon=False)
-    _style_axes(ax2, f"Skelp-End Weld Impact on Repair Amount ({unit}, Top 10, Latest Day)")
+    _style_axes(ax2, f"Skelp-End Weld Impact on Repair Amount ({unit}, Top 5, Latest Day)")
     fig2.tight_layout()
+    # Same base/impact + outside-if-too-small treatment as the ratio chart
+    # above, but on the raw amount values instead of percentages.
+    amount_max_stack = (
+        (amount_top["total_repair_amount"] + amount_top["skelp_impact_amount"]).max() if len(amount_top) else 0
+    )
+    for xi, v, imp, qty in zip(x2, amount_top["total_repair_amount"], amount_top["skelp_impact_amount"], amount_top["qty"]):
+        base_fits = amount_max_stack and v >= amount_max_stack * 0.1
+        impact_fits = amount_max_stack and imp >= amount_max_stack * 0.08
+        if base_fits:
+            ax2.text(xi, v / 2, f"{v:.2f}\nQty {qty}", ha="center", va="center", color="white", fontsize=7.5)
+        if impact_fits:
+            ax2.text(xi, v + imp / 2, f"+{imp:.2f}", ha="center", va="center", color="white", fontsize=8)
+        # Impact line first, repair-amount line last — see the ratio chart above.
+        outside_lines = []
+        if not impact_fits:
+            outside_lines.append(f"+{imp:.2f}")
+        if not base_fits:
+            outside_lines.append(f"{v:.2f} (Qty {qty})")
+        if outside_lines:
+            ax2.text(
+                xi, v + imp + amount_max_stack * 0.02, "\n".join(outside_lines),
+                ha="center", va="bottom", color="#1e293b", fontsize=7,
+            )
     amount_img = _figure_to_image(fig2, _HALF_WIDTH)
 
     return ratio_img, amount_img
@@ -375,9 +416,11 @@ def _dimension_ratio_chart(master_df: pd.DataFrame, selected_date) -> Image:
     return _figure_to_image(fig, _USABLE_WIDTH)
 
 
-def _bubble_chart(latest_df: pd.DataFrame, x_col: str, x_label: str, title: str, label_col: str = "project_label") -> Image:
-    """label_col is "project_label" for the by-project variants, or
-    "dimensions" for the by-dimension variant."""
+def _bubble_chart(
+    latest_df: pd.DataFrame, x_col: str, x_label: str, title: str, label_col: str = "project_label_clean"
+) -> Image:
+    """label_col is "project_label_clean" (no "20XXQ-" prefix) for the
+    by-project variants, or "dimensions" for the by-dimension variant."""
     sizes = latest_df["total_repair_amount"]
     max_size = sizes.max() or 1
     # Area-based marker sizing (matplotlib's `s` is area in points^2),
@@ -501,6 +544,11 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
     # Same fix as the dashboard: project_no alone repeats across dimensions,
     # so every per-project chart below keys off project_label instead.
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
+    # Prefix-stripped variant for on-chart labels (bubble chart) — same
+    # "20XXQ-" strip the pareto/skelp charts already use.
+    latest_df["project_label_clean"] = (
+        latest_df["project_no"].map(_strip_quarter_prefix) + " (" + latest_df["dimensions"].astype(str) + ")"
+    )
     latest_df["repair_ratio_pct"] = (latest_df["repair_ratio"] * 100).round(4)
 
     # Ratios above are computed from the raw feet/meter columns (the
