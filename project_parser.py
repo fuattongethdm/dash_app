@@ -35,10 +35,10 @@ NON_PROJECT_SHEETS = {
 }
 
 _LABEL_PREFIX = "repairrate"
-# Two label formats seen across sheets: "129' 8\" ft" (feet+inches) and
-# "134.54 FT" / "134.54 ft" (decimal feet).
+# Label formats seen across sheets: "129' 8\" ft" (feet+inches) and
+# "134.54 FT" / "134.54 ft" / "65 feet" (decimal feet, "ft" or spelled out).
 _LENGTH_FT_IN_RE = re.compile(r"(\d+)\s*'\s*(\d+)?\s*\"")
-_LENGTH_DECIMAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ft\b", re.IGNORECASE)
+_LENGTH_DECIMAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:ft|feet)\b", re.IGNORECASE)
 
 PIPE_NO_ROW_OFFSET = 4
 DATA_ROW_OFFSET = 5
@@ -49,6 +49,13 @@ DATA_ROW_OFFSET = 5
 # so sheets that already match the standard offsets are unaffected.
 PIPE_NO_ROW_OFFSET_COMPACT = 2
 DATA_ROW_OFFSET_COMPACT = 3
+# A third block variant (seen on "10-108 (60x.375)") has the ratio value
+# three columns right of the anchor instead of directly under it
+# ("Coating", offset 0) or two over ("Clutch", offset 2) — every block on
+# that sheet is labeled "Coating" in its own text, so this offset is
+# treated as another Coating position. pipe_no/amount stay at the standard
+# row offsets there, so no row-offset change is needed for it.
+RATIO_COL_OFFSET_ALT = 3
 
 
 @dataclass
@@ -130,11 +137,14 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
     for anchor_row, anchor_col in anchors:
         coating_ratio = coerce_number(grid.get((anchor_row, anchor_col)))
         clutch_ratio = coerce_number(grid.get((anchor_row, anchor_col + 2)))
+        alt_ratio = coerce_number(grid.get((anchor_row, anchor_col + RATIO_COL_OFFSET_ALT)))
 
         if coating_ratio is not None:
             repair_ratio, repair_category = coating_ratio, "Coating"
         elif clutch_ratio is not None:
             repair_ratio, repair_category = clutch_ratio, "Clutch"
+        elif alt_ratio is not None:
+            repair_ratio, repair_category = alt_ratio, "Coating"
         else:
             continue  # unused template slot, not an actual pipe entry
 
