@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback, dash_table, dcc, html
+from dash import Input, Output, State, callback, clientside_callback, dash_table, dcc, html
 from dash.dash_table.Format import Format, Scheme
 
 from calculations import (
@@ -51,7 +51,7 @@ from database import (
 )
 from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report
-from pipe_analysis import summarize_pipe_totals_by_sheet, worst_pipes
+from pipe_analysis import worst_pipes
 from project_parser import parse_project_pipe_repairs
 from validators import mark_duplicate_counts
 
@@ -122,6 +122,10 @@ COLOR_PLATE = "#7c3aed"
 COLOR_SECONDARY = "#f97316"
 COLOR_MUTED = "#94a3b8"
 
+# Pipe-level repair_category values (project_parser.py's "Coating" vs
+# "Clutch" block sides) — used to color-code the production-order chart.
+_CATEGORY_COLORS = {"Coating": COLOR_COIL, "Clutch": COLOR_SECONDARY}
+
 # How many of the most recent days the trend charts (Overall/Type/Project/
 # Dimension Detail) show, and the window the fitted trend line is drawn
 # over — one constant so both stay in sync and are easy to change later.
@@ -130,6 +134,14 @@ TREND_WINDOW_DAYS = 20
 # How many of the "worst" (highest repair-ratio) bubbles get their project
 # name shown on the chart instead of just the ratio value.
 BUBBLE_LABEL_TOP_N = 5
+
+# The initial bulk import (and pipes recovered later by parser fixes, which
+# are backdated to blend into that same original batch instead of showing
+# up as a fake spike on whatever day they were recovered) landed on
+# 2026-07-24 — a lump of pre-existing history, not real day-to-day repair
+# activity. The "Pipes Repaired per Day" chart hides anything before this
+# floor so that lump doesn't dwarf the real daily counts.
+PIPE_TREND_FLOOR_DATE = pd.Timestamp("2026-08-03")
 
 
 TEXT_COLUMNS = {
@@ -304,39 +316,13 @@ def layout():
                             ),
                             html.Section(
                                 [
-                                    html.H2("Project Trend"),
+                                    html.H2("Pipe Activity Overview"),
                                     html.P(
-                                        "Select a project + dimensions to see its repair ratio over all report dates.",
+                                        "Which pipes were repaired most recently, across every mapped "
+                                        "project — for one project's own charts, see the Pipe Analysis tab.",
                                         className="help-text",
                                     ),
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                [
-                                                    html.Label("Project (Dimensions)"),
-                                                    dcc.Dropdown(id="project-trend-dropdown"),
-                                                ],
-                                                className="filter-field",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Label("Series"),
-                                                    dcc.Checklist(
-                                                        id="project-trend-checklist",
-                                                        options=[
-                                                            {"label": "Excl. Skelp", "value": "Excl"},
-                                                            {"label": "Incl. Skelp", "value": "Incl"},
-                                                        ],
-                                                        value=["Excl", "Incl"],
-                                                        inline=True,
-                                                    ),
-                                                ],
-                                                className="filter-field",
-                                            ),
-                                        ],
-                                        className="filter-row",
-                                    ),
-                                    dcc.Loading(html.Div(id="project-trend-content")),
+                                    dcc.Loading(html.Div(id="pipe-overview-content")),
                                 ],
                                 className="card",
                             ),
@@ -376,15 +362,11 @@ def layout():
                                     html.H2("Pipe-Level Analysis"),
                                     html.P(
                                         "Per-pipe repair data parsed from each project sheet during "
-                                        "Excel import. Pick a report date and a project sheet to inspect.",
+                                        "Excel import. Pick a project to see everything about it.",
                                         className="help-text",
                                     ),
                                     html.Div(
                                         [
-                                            html.Div(
-                                                [html.Label("Report Date"), dcc.Dropdown(id="pipe-date-dropdown")],
-                                                className="filter-field",
-                                            ),
                                             html.Div(
                                                 [html.Label("Project"), dcc.Dropdown(id="pipe-sheet-dropdown")],
                                                 className="filter-field",
@@ -393,6 +375,44 @@ def layout():
                                         className="filter-row",
                                     ),
                                     dcc.Loading(html.Div(id="pipe-analysis-content")),
+                                ],
+                                className="card",
+                            ),
+                            html.Section(
+                                [
+                                    html.H2("Project Trend"),
+                                    html.P(
+                                        "Select a project + dimensions to see its repair ratio over all report dates.",
+                                        className="help-text",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [
+                                                    html.Label("Project (Dimensions)"),
+                                                    dcc.Dropdown(id="project-trend-dropdown"),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label("Series"),
+                                                    dcc.Checklist(
+                                                        id="project-trend-checklist",
+                                                        options=[
+                                                            {"label": "Excl. Skelp", "value": "Excl"},
+                                                            {"label": "Incl. Skelp", "value": "Incl"},
+                                                        ],
+                                                        value=["Excl", "Incl"],
+                                                        inline=True,
+                                                    ),
+                                                ],
+                                                className="filter-field",
+                                            ),
+                                        ],
+                                        className="filter-row",
+                                    ),
+                                    dcc.Loading(html.Div(id="project-trend-content")),
                                 ],
                                 className="card",
                             ),
@@ -800,6 +820,46 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     bar_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
+    # --- Pipes repaired per day (all mapped projects) — grouped side by
+    # side with the amount chart above since they're often looked at
+    # together, even though they measure different things (repair volume
+    # in ft/m vs. pipe count). first_seen_date is the day a pipe was first
+    # repaired (see upsert_pipe_repair_details); PIPE_TREND_FLOOR_DATE hides
+    # the initial bulk-import lump so it doesn't dwarf real daily activity.
+    daily_pipe_fig = None
+    pipe_df_for_daily = load_pipe_repair_details()
+    if not pipe_df_for_daily.empty:
+        pipe_label_map = _pipe_sheet_label_map(load_project_sheet_links())
+        mapped_pipe_df = pipe_df_for_daily[pipe_df_for_daily["project_sheet"].isin(pipe_label_map)]
+        if not mapped_pipe_df.empty:
+            daily_pipe_window_start = max(
+                mapped_pipe_df["first_seen_date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS),
+                PIPE_TREND_FLOOR_DATE,
+            )
+            daily_pipe_counts = (
+                mapped_pipe_df[mapped_pipe_df["first_seen_date"] >= daily_pipe_window_start]
+                .groupby(mapped_pipe_df["first_seen_date"].dt.date)
+                .size()
+                .reset_index(name="count")
+                .rename(columns={"first_seen_date": "date"})
+            )
+            daily_pipe_fig = px.bar(daily_pipe_counts, x="date", y="count")
+            daily_pipe_fig.update_traces(
+                marker_color=COLOR_SECONDARY,
+                texttemplate="%{y}",
+                textposition="outside",
+                hovertemplate="%{x|%d.%m.%Y}<br>Pipes Repaired: <b>%{y}</b><extra></extra>",
+            )
+            daily_pipe_fig.update_layout(
+                title="Pipes Repaired per Day (All Projects)",
+                xaxis_title="Date",
+                yaxis_title="Pipes Repaired",
+                template="plotly_white",
+                margin=dict(l=40, r=20, t=50, b=40),
+                hoverlabel=HOVER_STYLE,
+            )
+            daily_pipe_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
+
     # --- Worst-performing projects (latest day) ---
     worst = latest_df.sort_values("repair_ratio", ascending=False).head(10)
     worst_fig = px.bar(
@@ -1003,43 +1063,6 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     )
     skelp_amount_fig.update_xaxes(tickangle=-25)
 
-    # --- Repair amount by dimension (data only — still feeds the weighted-
-    # ratio-by-dimension chart below; its own chart slot now shows the
-    # skelp-impact-on-amount chart above instead) ---
-    dimension_df = (
-        latest_df.groupby("dimensions", as_index=False)
-        .agg(
-            total_repair_amount=("total_repair_amount", "sum"),
-            repaired_spiral_length=("repaired_spiral_length", "sum"),
-            project_count=("project_no", "nunique"),
-        )
-        .sort_values("total_repair_amount", ascending=False)
-        .head(15)
-    )
-
-    # --- Weighted repair ratio by dimension ---
-    dimension_ratio_df = dimension_df.copy()
-    denom = dimension_ratio_df["repaired_spiral_length"] * METERS_PER_FOOT
-    dimension_ratio_df["weighted_ratio"] = (dimension_ratio_df["total_repair_amount"] / denom.where(denom != 0)).fillna(0)
-    dimension_ratio_df = dimension_ratio_df.sort_values("weighted_ratio", ascending=False)
-    dimension_ratio_fig = px.bar(
-        dimension_ratio_df,
-        x="dimensions",
-        y="weighted_ratio",
-        labels={"dimensions": "Dimensions", "weighted_ratio": "Weighted Repair Ratio"},
-        title="Weighted Repair Ratio by Dimension (Latest Day)",
-    )
-    dimension_ratio_fig.update_traces(
-        marker_color=COLOR_COIL,
-        texttemplate="%{y:.2%}",
-        textposition="outside",
-        textfont=dict(size=11),
-        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
-    )
-    dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
-    dimension_ratio_fig.update_xaxes(tickangle=-45)
-    dimension_ratio_fig.update_yaxes(tickformat=".2%")
-
     # --- Repair amount pareto: which projects drive most of the total ---
     pareto_df = latest_df[["project_label_clean", "qty", "total_repair_amount"]].sort_values(
         "total_repair_amount", ascending=False
@@ -1216,8 +1239,9 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
                 ],
                 className="chart-row",
             ),
-            dcc.Graph(figure=ratio_pareto_fig),
-            dcc.Graph(figure=pareto_fig),
+            dcc.Graph(id="pareto-ratio-graph", figure=ratio_pareto_fig),
+            dcc.Graph(id="pareto-amount-graph", figure=pareto_fig),
+            html.Div(id="pareto-charts-hover-sync", style={"display": "none"}),
             html.Div(
                 [
                     dcc.RadioItems(
@@ -1225,7 +1249,6 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
                         options=[
                             {"label": "By Project — Spiral Length", "value": "project_spiral"},
                             {"label": "By Project — Pipe Length", "value": "project_pipe"},
-                            {"label": "By Dimension — Spiral Length", "value": "dimension_spiral"},
                         ],
                         value="project_spiral",
                         inline=True,
@@ -1234,12 +1257,114 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
                 ],
                 className="bubble-view-row",
             ),
-            dcc.Graph(figure=dimension_ratio_fig),
-            dcc.Graph(figure=bar_fig),
+            html.Div(
+                [dcc.Graph(id="daily-amount-graph", figure=bar_fig, className="chart-half")]
+                + (
+                    [dcc.Graph(id="daily-pipe-count-graph", figure=daily_pipe_fig, className="chart-half")]
+                    if daily_pipe_fig is not None
+                    else []
+                ),
+                className="chart-row",
+            ),
+            # Dummy target for the clientside hover-sync callback below —
+            # Plotly.restyle does the actual work directly on the graph divs
+            # via native plotly_hover/plotly_unhover listeners; this div's
+            # own content is never used.
+            html.Div(id="daily-charts-hover-sync", style={"display": "none"}),
             html.H3("Latest Day — Project Details"),
             detail_table,
         ]
     )
+
+
+# Hovering a bar in either of the two daily charts lightens the matching
+# date's bar in the other (see assets/daily_charts_hover_sync.js). Wired to
+# native Plotly events directly rather than Dash's hoverData prop — that
+# prop didn't reliably reset to null on mouse-leave, which left the
+# highlight stuck. Re-fires (idempotently) whenever the Dashboard tab's
+# content is rebuilt, since that's when the graph divs are (re)created.
+clientside_callback(
+    "window.dash_clientside.clientside.wireDailyChartsSync",
+    Output("daily-charts-hover-sync", "children"),
+    Input("dashboard-content", "children"),
+)
+
+# Same idea, for the two Pareto charts (bar trace only — the cumulative-%
+# line trace is left alone). Matched by exact project label, not date
+# truncation, since the two Paretos are sorted by different metrics and so
+# don't share the same x-axis order.
+clientside_callback(
+    "window.dash_clientside.clientside.wireParetoChartsSync",
+    Output("pareto-charts-hover-sync", "children"),
+    Input("dashboard-content", "children"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Callback: Pipe Activity Overview (Dashboard tab) — cross-project "what's
+# newest" pipe list. The daily pipe-count chart itself lives in
+# render_dashboard now, grouped next to Daily Repair Amount. Kept separate
+# from the single-project Pipe Analysis tab, which only ever shows one
+# project's own charts at a time (see render_pipe_analysis).
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("pipe-overview-content", "children"),
+    Input("unit-toggle", "value"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),
+)
+def render_pipe_overview(selected_unit, _n_clicks, _import_result):
+    u = unit_label(selected_unit)
+    df = load_pipe_repair_details()
+    if df.empty:
+        return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
+
+    links_df = load_project_sheet_links()
+    label_map = _pipe_sheet_label_map(links_df)
+    mapped_df = df[df["project_sheet"].isin(label_map)]
+    if mapped_df.empty:
+        return _empty_state(
+            "No mapped projects yet. Check out the "
+            "feature/project-sheet-mapping-tool branch to link sheets first."
+        )
+
+    # Flat list of whichever pipes were first repaired on the most recent
+    # activity date — no date picker here (that's what Project Trend and
+    # the per-project pages are for); this is just "what's newest, right now".
+    latest_date = mapped_df["first_seen_date"].max()
+    newest_df = mapped_df[mapped_df["first_seen_date"] == latest_date]
+    confirmed_links = links_df[links_df["status"] == "confirmed"][["project_sheet", "project_no", "dimensions"]]
+    newest_df = newest_df.merge(confirmed_links, on="project_sheet", how="left").copy()
+    if "repair_amount" in newest_df.columns:
+        newest_df["repair_amount"] = amount_in_display_unit(newest_df["repair_amount"], selected_unit)
+    newest_columns = ["project_no", "dimensions", "pipe_no", "repair_amount", "repair_ratio"]
+    newest_df = newest_df[newest_columns].sort_values(["project_no", "pipe_no"])
+    newest_section = html.Div(
+        [
+            html.H3(f"Newest Pipes — {pd.Timestamp(latest_date).strftime('%d.%m.%Y')}"),
+            dash_table.DataTable(
+                data=_table_records(newest_df, newest_columns),
+                columns=_table_columns(
+                    newest_columns,
+                    label_overrides={
+                        "project_no": "Project",
+                        "pipe_no": "Pipe No.",
+                        "repair_amount": f"Repair Amount ({u})",
+                    },
+                ),
+                page_size=15,
+                sort_action="native",
+                filter_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell=TABLE_CELL_STYLE,
+                style_header=TABLE_HEADER_STYLE,
+                style_data_conditional=TABLE_CONDITIONAL_STYLE,
+            ),
+        ]
+    )
+
+    return html.Div([newest_section])
 
 
 def _summary_card(label: str, value: str) -> html.Div:
@@ -1314,6 +1439,64 @@ def _build_bubble_fig(
     return fig
 
 
+def _build_box_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go.Figure:
+    """Box plot of repair_ratio_pct grouped by x_col — shows the spread
+    (median, quartiles, outliers) within each group instead of collapsing
+    it to a single average, so a group that's "fine on average but wildly
+    inconsistent" doesn't look the same as one that's genuinely uniform.
+    Kept deliberately plain: only genuine outliers are drawn as points (not
+    every pipe — that turns into a wall of dots), and a dashed mean line
+    gives a second, more familiar reference next to the median."""
+    # One uniform color for every box (categories are already distinguished
+    # by their x-axis position/label) — matches how every other multi-
+    # category chart on this dashboard (Top 15, Pareto) uses a single color
+    # rather than a rainbow per bar. Outlier points use the dashboard's
+    # existing orange accent, its usual "this is the noteworthy part" color.
+    # hoveron="points" is the key fix for a real Plotly box-plot problem:
+    # by default hovering the box itself pops up a *separate* tooltip for
+    # each of its 7 internal stats (min/q1/median/mean/q3/max/fences),
+    # stacked on top of each other and burying the chart. Restricting hover
+    # to just the outlier dots (with the short template below) keeps the
+    # box itself simple to look at without a wall of redundant tooltips.
+    fig = px.box(df, x=x_col, y="repair_ratio_pct", points="outliers")
+    fig.update_traces(
+        boxmean=True,
+        fillcolor="rgba(37, 99, 235, 0.15)",
+        line=dict(color=COLOR_COIL),
+        marker=dict(size=6, color=COLOR_SECONDARY, opacity=0.85),
+        width=0.4,
+        hoveron="points",
+        hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2f}%</b><extra></extra>",
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title="Repair Ratio (%)",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=80),
+        hoverlabel=HOVER_STYLE,
+        showlegend=False,
+    )
+    fig.update_xaxes(tickangle=-25)
+    return fig
+
+
+def _box_plot_section(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> html.Div:
+    """Box plot plus a plain-language stat line underneath, so the takeaway
+    doesn't depend on knowing how to read a box-and-whisker shape. Width is
+    capped so a chart with only a handful of categories doesn't stretch
+    edge-to-edge and look mostly empty."""
+    fig = _build_box_fig(df, x_col, x_label, title)
+    ratios = df["repair_ratio_pct"]
+    caption = html.P(
+        f"Median: {ratios.median():.2f}%  •  Lowest: {ratios.min():.2f}%  •  Highest: {ratios.max():.2f}%"
+        " — the box covers where most values fall, the dashed line is the average, "
+        "orange dots are the individual exceptions.",
+        className="help-text",
+    )
+    return html.Div([dcc.Graph(figure=fig), caption], style={"maxWidth": "700px"})
+
+
 # ---------------------------------------------------------------------------
 # Callback: Production quality/volume matrix (bubble plot) — a view switcher
 # picks between two per-project variants (pipe length / spiral length on the
@@ -1334,25 +1517,6 @@ def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result)
 
     _latest_date, latest_df = _latest_day_frame(master_df)
     u = unit_label(selected_unit)
-
-    if selected_view == "dimension_spiral":
-        dim_df = latest_df.groupby("dimensions", as_index=False).agg(
-            repaired_spiral_length=("repaired_spiral_length", "sum"),
-            total_repair_amount=("total_repair_amount", "sum"),
-        )
-        denom = dim_df["repaired_spiral_length"] * METERS_PER_FOOT
-        dim_df["repair_ratio_pct"] = ((dim_df["total_repair_amount"] / denom.where(denom != 0)).fillna(0) * 100).round(4)
-        dim_df["repaired_spiral_length"] = length_in_display_unit(dim_df["repaired_spiral_length"], selected_unit)
-        dim_df["total_repair_amount"] = amount_in_display_unit(dim_df["total_repair_amount"], selected_unit)
-        fig = _build_bubble_fig(
-            dim_df,
-            x_col="repaired_spiral_length",
-            x_label=f"Total Spiral Length ({u})",
-            title=f"Repair Ratio vs. Production Volume by Dimension ({u}, Spiral Length, Latest Day)",
-            unit=u,
-            label_col="dimensions",
-        )
-        return dcc.Graph(figure=fig)
 
     bubble_df = latest_df[
         [
@@ -1386,6 +1550,7 @@ def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result)
         )
 
     return dcc.Graph(figure=fig)
+
 
 
 def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repair_ratio"):
@@ -1722,26 +1887,7 @@ def render_project_trend(selected_value, selected_series):
 
 
 # ---------------------------------------------------------------------------
-# Callback 5: Pipe-Level Analysis — populate the report date dropdown
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("pipe-date-dropdown", "options"),
-    Output("pipe-date-dropdown", "value"),
-    Input("pipe-date-dropdown", "id"),  # fires once, on page load
-    Input("import-confirm-result", "children"),  # refresh after a new import
-)
-def load_pipe_dates(_id, _import_result):
-    df = load_pipe_repair_details()
-    if df.empty:
-        return [], None
-    dates = sorted(df["first_seen_date"].dt.date.unique(), reverse=True)
-    options = [{"label": d.strftime("%d.%m.%Y"), "value": d.isoformat()} for d in dates]
-    return options, options[0]["value"]
-
-
-# ---------------------------------------------------------------------------
-# Callback 6: Pipe-Level Analysis — populate the project dropdown
+# Callback 5: Pipe-Level Analysis — populate the project dropdown
 # ---------------------------------------------------------------------------
 
 def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
@@ -1787,94 +1933,29 @@ def load_pipe_sheets(_id, _import_result):
 
 @callback(
     Output("pipe-analysis-content", "children"),
-    Input("pipe-date-dropdown", "value"),
     Input("pipe-sheet-dropdown", "value"),
     Input("unit-toggle", "value"),
 )
-def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
+def render_pipe_analysis(selected_sheet, selected_unit):
+    """Everything here is scoped to one selected project — cross-project
+    overview material (daily repair pace, all-projects summary) lives on
+    the Dashboard tab instead (see render_pipe_overview), so this tab stays
+    a focused single-project drill-down."""
     u = unit_label(selected_unit)
-    if not selected_date:
+    if not selected_sheet:
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
-    # pipe_repair_details is a current-state table (one row per physical
-    # pipe, kept up to date on every import — see upsert_pipe_repair_details)
-    # rather than a daily snapshot, so "All Projects — Summary" and the
-    # per-sheet drill-down below always reflect every pipe's latest known
-    # state, regardless of which date is selected. Only "Pipes Repaired on
-    # This Date" (added_df, below) is scoped to the selected date.
     df = load_pipe_repair_details()
+    if df.empty:
+        return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
-    # Only show sheets with a confirmed project mapping — the raw Excel
-    # sheet name on its own isn't meaningful here (see the
-    # feature/project-sheet-mapping-tool branch for how mappings are made).
     links_df = load_project_sheet_links()
     label_map = _pipe_sheet_label_map(links_df)
-    mapped_df = df[df["project_sheet"].isin(label_map)]
-
-    if mapped_df.empty:
-        return _empty_state(
-            "No mapped projects yet. Check out the "
-            "feature/project-sheet-mapping-tool branch to link sheets first."
-        )
-
-    summary_table = summarize_pipe_totals_by_sheet(mapped_df).rename(columns={"project_sheet": "project"})
-    summary_table["project"] = summary_table["project"].map(label_map)
-    summary_columns = list(summary_table.columns)
-    summary_section = html.Div(
-        [
-            html.H3("All Projects — Summary"),
-            dash_table.DataTable(
-                data=_table_records(summary_table, summary_columns),
-                columns=_table_columns(summary_columns),
-                page_size=10,
-                sort_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell=TABLE_CELL_STYLE,
-                style_header=TABLE_HEADER_STYLE,
-                style_data_conditional=TABLE_CONDITIONAL_STYLE,
-            ),
-        ]
-    )
-
-    # A pipe's first_seen_date is the day it was repaired, so this is the
-    # flat "what's new" list for the selected date, across all sheets —
-    # independent of the single-sheet drill-down below.
-    day_df = mapped_df[mapped_df["first_seen_date"].dt.date.astype(str) == selected_date]
-    confirmed_links = links_df[links_df["status"] == "confirmed"][["project_sheet", "project_no", "dimensions"]]
-    added_df = day_df.merge(confirmed_links, on="project_sheet", how="left").copy()
-    if "repair_amount" in added_df.columns:
-        added_df["repair_amount"] = amount_in_display_unit(added_df["repair_amount"], selected_unit)
-    added_columns = ["project_no", "dimensions", "pipe_no", "repair_amount", "repair_ratio"]
-    added_df = added_df[added_columns].sort_values(["project_no", "pipe_no"])
-    added_section = html.Div(
-        [
-            html.H3("Pipes Repaired on This Date"),
-            dash_table.DataTable(
-                data=_table_records(added_df, added_columns),
-                columns=_table_columns(
-                    added_columns,
-                    label_overrides={
-                        "project_no": "Project",
-                        "pipe_no": "Pipe No.",
-                        "repair_amount": f"Repair Amount ({u})",
-                    },
-                ),
-                page_size=15,
-                sort_action="native",
-                filter_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell=TABLE_CELL_STYLE,
-                style_header=TABLE_HEADER_STYLE,
-                style_data_conditional=TABLE_CONDITIONAL_STYLE,
-            ),
-        ]
-    )
-
-    if not selected_sheet:
-        return html.Div([summary_section, added_section])
+    sheet_df = df[df["project_sheet"] == selected_sheet].sort_values("pipe_no")
+    if sheet_df.empty:
+        return _empty_state("No pipe-level data for this project yet.")
 
     sheet_label = label_map.get(selected_sheet, selected_sheet)
-    sheet_df = mapped_df[mapped_df["project_sheet"] == selected_sheet].sort_values("pipe_no")
 
     worst_fig = px.bar(
         worst_pipes(sheet_df, top_n=15),
@@ -1893,6 +1974,69 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
     worst_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     worst_fig.update_xaxes(type="category")
     worst_fig.update_yaxes(tickformat=".2%")
+
+    # Pipes are produced in pipe_no order, so plotting every pipe (not just
+    # the worst 15) against that order shows whether bad pipes cluster at
+    # the start or end of the run — a single continuous line (not one line
+    # per repair_category, which would connect non-adjacent same-category
+    # pipes across everything in between) with marker color flagging
+    # Coating vs Clutch. pipe_no stays numeric so gaps from never-logged
+    # pipes show up as real spacing instead of being hidden.
+    sequence_fig = go.Figure()
+    sequence_fig.add_trace(
+        go.Scatter(
+            x=sheet_df["pipe_no"],
+            y=sheet_df["repair_ratio"],
+            mode="lines+markers",
+            name="Repair Ratio",
+            line=dict(color=COLOR_COIL, width=1.5),
+            marker=dict(
+                size=6,
+                color=[_CATEGORY_COLORS.get(c, COLOR_COIL) for c in sheet_df["repair_category"]],
+            ),
+            customdata=sheet_df["repair_category"],
+            hovertemplate="Pipe %{x}<br>Repair Ratio: <b>%{y:.2%}</b><br>%{customdata}<extra></extra>",
+        )
+    )
+    # Smoothed trend on top of the noisy per-pipe points — makes "is it
+    # trending worse toward the start or end of the run" readable without
+    # eyeballing every scattered point. min_periods=1 keeps this
+    # well-behaved even on a 1-pipe sheet.
+    rolling_window = 10
+    rolling_avg = sheet_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
+    sequence_fig.add_trace(
+        go.Scatter(
+            x=sheet_df["pipe_no"],
+            y=rolling_avg,
+            mode="lines",
+            name=f"{rolling_window}-Pipe Rolling Avg",
+            line=dict(color=COLOR_SECONDARY, width=2, dash="dot"),
+            hovertemplate="Pipe %{x}<br>Rolling Avg: <b>%{y:.2%}</b><extra></extra>",
+        )
+    )
+    sequence_fig.update_layout(
+        title=f"Repair Ratio by Production Order — {sheet_label}",
+        xaxis_title="Pipe No. (Production Order)",
+        yaxis_title="Repair Ratio",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+    )
+    sequence_fig.update_yaxes(tickformat=".2%")
+
+    # Distribution of this one project's pipe ratios — median/quartiles/
+    # outliers in a single box, complementing the production-order line
+    # above (which shows *where* in the run things went wrong; this shows
+    # *how consistent* the whole run was).
+    box_df = sheet_df[["repair_ratio"]].copy()
+    box_df["project_label"] = sheet_label
+    box_df["repair_ratio_pct"] = (box_df["repair_ratio"] * 100).round(4)
+    box_section = _box_plot_section(
+        box_df,
+        x_col="project_label",
+        x_label="Project",
+        title=f"Repair Ratio Distribution — {sheet_label}",
+    )
 
     sheet_df = sheet_df.copy()
     if "pipe_length_ft" in sheet_df.columns:
@@ -1922,10 +2066,10 @@ def render_pipe_analysis(selected_date, selected_sheet, selected_unit):
 
     return html.Div(
         [
-            summary_section,
-            added_section,
             html.H3(f"{sheet_label} — Pipe Details"),
             dcc.Graph(figure=worst_fig),
+            dcc.Graph(figure=sequence_fig),
+            box_section,
             detail_table,
         ]
     )
@@ -2016,8 +2160,11 @@ def load_dimension_options(_id, _import_result):
 @callback(
     Output("dimension-detail-content", "children"),
     Input("dimension-detail-dropdown", "value"),
+    Input("unit-toggle", "value"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),
 )
-def render_dimension_detail(selected_dimension):
+def render_dimension_detail(selected_dimension, selected_unit, _n_clicks, _import_result):
     if not selected_dimension:
         return _empty_state("No data available. Import an Excel file first.")
 
@@ -2025,6 +2172,66 @@ def render_dimension_detail(selected_dimension):
     latest_date = master_df["date"].max()
     latest_df = master_df[master_df["date"] == latest_date].copy()
     latest_df = apply_meter_based_repair_ratios(latest_df)
+    u = unit_label(selected_unit)
+
+    # --- All-dimensions overview (moved here from the main Dashboard card
+    # and the bubble-view-toggle, so every dimension-grouped chart lives
+    # together in one place instead of being split across two tabs). ---
+    overview_dim_df = (
+        latest_df.groupby("dimensions", as_index=False)
+        .agg(
+            total_repair_amount=("total_repair_amount", "sum"),
+            repaired_spiral_length=("repaired_spiral_length", "sum"),
+        )
+        .sort_values("total_repair_amount", ascending=False)
+        .head(15)
+    )
+    overview_denom = overview_dim_df["repaired_spiral_length"] * METERS_PER_FOOT
+    overview_dim_df["weighted_ratio"] = (
+        overview_dim_df["total_repair_amount"] / overview_denom.where(overview_denom != 0)
+    ).fillna(0)
+    overview_dim_df = overview_dim_df.sort_values("weighted_ratio", ascending=False)
+    dimension_ratio_fig = px.bar(
+        overview_dim_df,
+        x="dimensions",
+        y="weighted_ratio",
+        labels={"dimensions": "Dimensions", "weighted_ratio": "Weighted Repair Ratio"},
+        title="Weighted Repair Ratio by Dimension (Latest Day)",
+    )
+    dimension_ratio_fig.update_traces(
+        marker_color=COLOR_COIL,
+        texttemplate="%{y:.2%}",
+        textposition="outside",
+        textfont=dict(size=11),
+        hovertemplate="%{x}<br>Weighted Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+    )
+    dimension_ratio_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=80), hoverlabel=HOVER_STYLE)
+    dimension_ratio_fig.update_xaxes(tickangle=-45)
+    dimension_ratio_fig.update_yaxes(tickformat=".2%")
+
+    overview_bubble_df = latest_df.groupby("dimensions", as_index=False).agg(
+        repaired_spiral_length=("repaired_spiral_length", "sum"),
+        total_repair_amount=("total_repair_amount", "sum"),
+    )
+    overview_bubble_denom = overview_bubble_df["repaired_spiral_length"] * METERS_PER_FOOT
+    overview_bubble_df["repair_ratio_pct"] = (
+        (overview_bubble_df["total_repair_amount"] / overview_bubble_denom.where(overview_bubble_denom != 0)).fillna(0)
+        * 100
+    ).round(4)
+    overview_bubble_df["repaired_spiral_length"] = length_in_display_unit(
+        overview_bubble_df["repaired_spiral_length"], selected_unit
+    )
+    overview_bubble_df["total_repair_amount"] = amount_in_display_unit(
+        overview_bubble_df["total_repair_amount"], selected_unit
+    )
+    dimension_bubble_fig = _build_bubble_fig(
+        overview_bubble_df,
+        x_col="repaired_spiral_length",
+        x_label=f"Total Spiral Length ({u})",
+        title=f"Repair Ratio vs. Production Volume by Dimension ({u}, Spiral Length, Latest Day)",
+        unit=u,
+        label_col="dimensions",
+    )
 
     dim_df = latest_df[latest_df["dimensions"] == selected_dimension].sort_values(
         "repair_ratio", ascending=False
@@ -2111,4 +2318,37 @@ def render_dimension_detail(selected_dimension):
         style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
-    return html.Div([dcc.Graph(figure=trend_fig), dcc.Graph(figure=fig), table])
+    children = [
+        dcc.Graph(figure=dimension_ratio_fig),
+        dcc.Graph(figure=dimension_bubble_fig),
+        html.H3(f"Dimension {selected_dimension} — Detail"),
+        dcc.Graph(figure=trend_fig),
+        dcc.Graph(figure=fig),
+        table,
+    ]
+
+    # Pipe-level distribution, one box per project sharing this dimension —
+    # only the handful of projects with this exact dimension, so it stays
+    # readable (unlike a single chart trying to compare every dimension or
+    # every project on the dashboard at once). Pipe-level data is optional
+    # (feature/project-sheet-mapping-tool branch), so this is skipped
+    # gracefully if none of these projects have a confirmed sheet mapping
+    # or any pipe-level rows yet.
+    links_df = load_project_sheet_links()
+    dim_sheets = links_df[(links_df["status"] == "confirmed") & (links_df["dimensions"] == selected_dimension)]
+    if not dim_sheets.empty:
+        pipe_df = load_pipe_repair_details()
+        box_df = pipe_df[pipe_df["project_sheet"].isin(dim_sheets["project_sheet"])].copy()
+        if not box_df.empty:
+            label_map = dict(zip(dim_sheets["project_sheet"], dim_sheets["project_no"]))
+            box_df["project_label"] = box_df["project_sheet"].map(label_map)
+            box_df["repair_ratio_pct"] = (box_df["repair_ratio"] * 100).round(4)
+            box_section = _box_plot_section(
+                box_df,
+                x_col="project_label",
+                x_label="Project",
+                title=f"Repair Ratio Distribution — Pipe-Level Detail, Dimension {selected_dimension}",
+            )
+            children.append(box_section)
+
+    return html.Div(children)
