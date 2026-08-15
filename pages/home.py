@@ -316,12 +316,7 @@ def layout():
                             ),
                             html.Section(
                                 [
-                                    html.H2("Pipe Activity Overview"),
-                                    html.P(
-                                        "Which pipes were repaired most recently, across every mapped "
-                                        "project — for one project's own charts, see the Pipe Analysis tab.",
-                                        className="help-text",
-                                    ),
+                                    html.H2("Pipe Activity Overview"),       
                                     dcc.Loading(html.Div(id="pipe-overview-content")),
                                 ],
                                 className="card",
