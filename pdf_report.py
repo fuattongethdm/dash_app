@@ -17,6 +17,10 @@ import re
 import matplotlib
 
 matplotlib.use("Agg")
+# Pin directly to the font that's already first in the default "sans-serif"
+# fallback list (always bundled with matplotlib) — skips re-walking that
+# list on every one of the many text/label draws these charts make.
+matplotlib.rcParams["font.family"] = "DejaVu Sans"
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -101,12 +105,18 @@ def _figure_to_image(fig, width: float) -> Image:
     computing height from the actual saved PNG's pixel aspect ratio (not
     the nominal figsize) so bbox_inches="tight" cropping can never distort
     the image the way a hardcoded width/height pair would.
+
+    dpi=140 (not matplotlib's print-quality default) — the report has
+    ~10 of these per PDF, generated synchronously in one request, and this
+    is the main lever on how long that takes without visibly softening the
+    output at the print size these end up at.
     """
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
-    aspect = PILImage.open(buf).height / PILImage.open(buf).width
+    with PILImage.open(buf) as img:
+        aspect = img.height / img.width
     buf.seek(0)
     return Image(buf, width=width, height=width * aspect)
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 
@@ -23,11 +25,16 @@ def length_in_display_unit(values, display_unit: str):
     return values
 
 
+_WS_RE = re.compile(r"\s+")
+_REV_SUFFIX_RE = re.compile(r"\s+#\d+$")
+_DASH_SUFFIX_RE = re.compile(r"\s+-\s+\d+$")
+
+
 def normalize_repair_trend_project_key(project_no) -> str:
     value = str(project_no).strip()
-    value = pd.Series([value]).str.replace(r"\s+", " ", regex=True).iloc[0]
-    value = pd.Series([value]).str.replace(r"\s+#\d+$", "", regex=True).iloc[0]
-    return pd.Series([value]).str.replace(r"\s+-\s+\d+$", "", regex=True).iloc[0]
+    value = _WS_RE.sub(" ", value)
+    value = _REV_SUFFIX_RE.sub("", value)
+    return _DASH_SUFFIX_RE.sub("", value)
 
 
 def apply_meter_based_repair_ratios(df: pd.DataFrame) -> pd.DataFrame:
