@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+import time
 
 import dash
 import numpy as np
@@ -311,6 +312,13 @@ def layout():
                                     ),
                                     dcc.Download(id="pdf-report-download"),
                                     dcc.Loading(html.Div(id="dashboard-content")),
+                                    # Lightweight "stage ready" signals the
+                                    # sections below chain off of instead of
+                                    # each other's full (heavy, Plotly-JSON-
+                                    # laden) children — see render_dashboard /
+                                    # render_pipe_overview.
+                                    dcc.Store(id="dashboard-stage-1"),
+                                    dcc.Store(id="dashboard-stage-2"),
                                 ],
                                 className="card",
                             ),
@@ -514,14 +522,6 @@ def _empty_state(message: str) -> html.Div:
     return html.Div(message, className="empty-state")
 
 
-def _project_label_clean(project_no, dimensions) -> str:
-    """Same shape as project_label, but with the leading "20XXQ-"
-    report-quarter prefix stripped — used on the repair-ratio charts, whose
-    bars carry the pipe quantity instead (see _add_bar_value_annotations)."""
-    stripped = re.sub(r"^\d{4}Q-", "", str(project_no))
-    return f"{stripped} ({dimensions})"
-
-
 def _add_bar_value_annotations(
     fig: go.Figure,
     categories,
@@ -575,9 +575,8 @@ def _latest_day_frame(master_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.DataFra
     # pareto bar+line) will collapse repeated labels onto one x position
     # and the line will zigzag/fold back on itself.
     latest_df["project_label"] = latest_df["project_no"].astype(str) + " (" + latest_df["dimensions"].astype(str) + ")"
-    latest_df["project_label_clean"] = latest_df.apply(
-        lambda r: _project_label_clean(r["project_no"], r["dimensions"]), axis=1
-    )
+    stripped_project_no = latest_df["project_no"].astype(str).str.replace(r"^\d{4}Q-", "", regex=True)
+    latest_df["project_label_clean"] = stripped_project_no + " (" + latest_df["dimensions"].astype(str) + ")"
     return latest_date, latest_df
 
 
@@ -759,13 +758,7 @@ def download_pdf_report(n_clicks, selected_unit):
 # Callback 4: Load / refresh the dashboard
 # ---------------------------------------------------------------------------
 
-@callback(
-    Output("dashboard-content", "children"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),  # auto-refresh after a successful import
-    Input("unit-toggle", "value"),
-)
-def render_dashboard(_n_clicks, _import_result, selected_unit):
+def _render_dashboard_inner(selected_unit):
     master_df = load_master_data()
 
     if master_df.empty:
@@ -1087,7 +1080,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             yaxis="y2",
             line=dict(color=COLOR_SECONDARY, width=2),
             mode="lines+markers+text",
-            text=pareto_df["cumulative_pct"].map(lambda v: f"{v:.2f}%"),
+            text=pareto_df["cumulative_pct"].map("{:.2f}%".format),
             textposition="top center",
             textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
@@ -1142,7 +1135,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
             yaxis="y2",
             line=dict(color=COLOR_SECONDARY, width=2),
             mode="lines+markers+text",
-            text=ratio_pareto_df["cumulative_pct"].map(lambda v: f"{v:.2f}%"),
+            text=ratio_pareto_df["cumulative_pct"].map("{:.2f}%".format),
             textposition="top center",
             textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x}<br>Cumulative: <b>%{y:.2f}%</b><extra></extra>",
@@ -1272,6 +1265,32 @@ def render_dashboard(_n_clicks, _import_result, selected_unit):
     )
 
 
+@callback(
+    Output("dashboard-content", "children"),
+    Output("dashboard-stage-1", "data"),
+    Input("refresh-dashboard-btn", "n_clicks"),
+    Input("import-confirm-result", "children"),  # auto-refresh after a successful import
+    Input("unit-toggle", "value"),
+    Input("dashboard-tabs", "value"),
+)
+def render_dashboard(_n_clicks, _import_result, selected_unit, active_tab):
+    # Only the Dashboard tab needs this (heavy: several charts + a full
+    # master_df load) — skip the work entirely while another tab is active,
+    # instead of rebuilding content nobody can see on every unit-toggle/
+    # refresh/import. Fires again once active_tab switches back here.
+    if active_tab != "tab-dashboard":
+        return dash.no_update, dash.no_update
+    # dashboard-stage-1 is what pipe-overview-content / the sub-chart
+    # callbacks below chain off of (a lightweight signal, not this div's own
+    # heavy children) — always write a fresh value here, even on error, or
+    # a stuck signal would leave every downstream spinner spinning forever.
+    try:
+        content = _render_dashboard_inner(selected_unit)
+    except Exception:
+        content = _empty_state("Something went wrong loading the dashboard. Try refreshing.")
+    return content, time.time()
+
+
 # Hovering a bar in either of the two daily charts lightens the matching
 # date's bar in the other (see assets/daily_charts_hover_sync.js). Wired to
 # native Plotly events directly rather than Dash's hoverData prop — that
@@ -1303,13 +1322,7 @@ clientside_callback(
 # project's own charts at a time (see render_pipe_analysis).
 # ---------------------------------------------------------------------------
 
-@callback(
-    Output("pipe-overview-content", "children"),
-    Input("unit-toggle", "value"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),
-)
-def render_pipe_overview(selected_unit, _n_clicks, _import_result):
+def _render_pipe_overview_inner(selected_unit):
     u = unit_label(selected_unit)
     df = load_pipe_repair_details()
     if df.empty:
@@ -1362,6 +1375,21 @@ def render_pipe_overview(selected_unit, _n_clicks, _import_result):
     return html.Div([newest_section])
 
 
+@callback(
+    Output("pipe-overview-content", "children"),
+    Output("dashboard-stage-2", "data"),
+    Input("dashboard-stage-1", "data"),  # chained after dashboard-content, not parallel to it
+    State("unit-toggle", "value"),
+    prevent_initial_call=True,
+)
+def render_pipe_overview(_stage_1, selected_unit):
+    try:
+        content = _render_pipe_overview_inner(selected_unit)
+    except Exception:
+        content = _empty_state("Something went wrong loading pipe activity. Try refreshing.")
+    return content, time.time()
+
+
 def _summary_card(label: str, value: str) -> html.Div:
     return html.Div(
         [html.Div(value, className="summary-value"), html.Div(label, className="summary-label")],
@@ -1387,10 +1415,8 @@ def _build_bubble_fig(
     ``BUBBLE_LABEL_TOP_N`` points also get their name on-chart, not just
     hover — the rest just show the ratio, to keep the chart readable."""
     worst_idx = set(df.nlargest(BUBBLE_LABEL_TOP_N, "repair_ratio_pct").index)
-    text_values = [
-        f"{row[label_col]}<br>{row['repair_ratio_pct']:.2f}%" if idx in worst_idx else f"{row['repair_ratio_pct']:.2f}%"
-        for idx, row in df.iterrows()
-    ]
+    ratio_text = df["repair_ratio_pct"].map("{:.2f}%".format)
+    text_values = (df[label_col].astype(str) + "<br>" + ratio_text).where(df.index.isin(worst_idx), ratio_text)
 
     fig = go.Figure()
     fig.add_trace(
@@ -1501,11 +1527,11 @@ def _box_plot_section(df: pd.DataFrame, x_col: str, x_label: str, title: str) ->
 @callback(
     Output("bubble-chart-content", "children"),
     Input("bubble-view-toggle", "value"),
-    Input("unit-toggle", "value"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),
+    Input("dashboard-stage-1", "data"),  # chained after dashboard-content, not parallel to it
+    State("unit-toggle", "value"),
+    prevent_initial_call=True,
 )
-def render_bubble_chart(selected_view, selected_unit, _n_clicks, _import_result):
+def render_bubble_chart(selected_view, _stage_1, selected_unit):
     master_df = load_master_data()
     if master_df.empty:
         return _empty_state("No data available. Import an Excel file first.")
@@ -1586,17 +1612,17 @@ def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repai
 # ---------------------------------------------------------------------------
 # Callback: Coil and Plate Repair Rate Trend — same idea as the production-type
 # trend below: a checklist isolates Excl./Incl. Skelp, and a linear trend
-# line is drawn (last 30 days, or the full range if shorter) when only one
-# of the two is selected.
+# line is drawn (last TREND_WINDOW_DAYS days, or the full range if shorter)
+# when only one of the two is selected.
 # ---------------------------------------------------------------------------
 
 @callback(
     Output("overall-trend-graph-content", "children"),
     Input("overall-trend-checklist", "value"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),
+    Input("dashboard-stage-1", "data"),  # chained after dashboard-content, not parallel to it
+    prevent_initial_call=True,
 )
-def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
+def render_overall_trend_chart(selected_series, _stage_1):
     master_df = load_master_data()
     if master_df.empty or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
@@ -1617,7 +1643,7 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
                 mode="lines+markers+text",
                 name="Excl. Skelp",
                 line=dict(color=COLOR_COIL, width=3),
-                text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(overall_ratio["weighted_repair_ratio"] * 100).map("{:.2f}%".format),
                 textposition="top center",
                 textfont=dict(size=10, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
@@ -1631,7 +1657,7 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
                 mode="lines+markers+text",
                 name="Incl. Skelp",
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-                text=(overall_ratio["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(overall_ratio["weighted_repair_ratio_incl_skelp"] * 100).map("{:.2f}%".format),
                 textposition="bottom center",
                 textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
@@ -1676,10 +1702,10 @@ def render_overall_trend_chart(selected_series, _n_clicks, _import_result):
 @callback(
     Output("type-trend-graph-content", "children"),
     Input("type-trend-checklist", "value"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),
+    Input("dashboard-stage-1", "data"),  # chained after dashboard-content, not parallel to it
+    prevent_initial_call=True,
 )
-def render_type_trend_chart(selected_types, _n_clicks, _import_result):
+def render_type_trend_chart(selected_types, _stage_1):
     master_df = load_master_data()
     if master_df.empty or not selected_types:
         return _empty_state("No data available. Import an Excel file first.")
@@ -1707,7 +1733,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
                 mode="lines+markers+text",
                 name=p_type,
                 line=dict(width=3, color=_TYPE_COLORS.get(p_type)),
-                text=(type_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(type_trend["weighted_repair_ratio"] * 100).map("{:.2f}%".format),
                 textposition="top center",
                 textfont=dict(size=10, color=_TYPE_COLORS.get(p_type)),
                 hovertemplate=f"%{{x|%d.%m.%Y}}<br>{p_type}: <b>%{{y:.2f}}%</b><extra></extra>",
@@ -1725,7 +1751,7 @@ def render_type_trend_chart(selected_types, _n_clicks, _import_result):
                 mode="lines+markers+text",
                 name="Mix (Coil + Plate)",
                 line=dict(width=3, color=COLOR_SECONDARY, dash="dash"),
-                text=(overall_ratio["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(overall_ratio["weighted_repair_ratio"] * 100).map("{:.2f}%".format),
                 textposition="bottom center",
                 textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Mix: <b>%{y:.2f}%</b><extra></extra>",
@@ -1804,8 +1830,11 @@ def load_project_trend_options(_id, _import_result):
     Output("project-trend-content", "children"),
     Input("project-trend-dropdown", "value"),
     Input("project-trend-checklist", "value"),
+    Input("dashboard-tabs", "value"),
 )
-def render_project_trend(selected_value, selected_series):
+def render_project_trend(selected_value, selected_series, active_tab):
+    if active_tab != "tab-pipe":
+        return dash.no_update
     if not selected_value or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
 
@@ -1832,7 +1861,7 @@ def render_project_trend(selected_value, selected_series):
                 mode="lines+markers+text",
                 name="Excl. Skelp",
                 line=dict(color=COLOR_COIL, width=3),
-                text=(project_df["repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(project_df["repair_ratio"] * 100).map("{:.2f}%".format),
                 textposition="top center",
                 textfont=dict(size=10, color=COLOR_COIL),
                 hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
@@ -1846,7 +1875,7 @@ def render_project_trend(selected_value, selected_series):
                 mode="lines+markers+text",
                 name="Incl. Skelp",
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-                text=(project_df["repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+                text=(project_df["repair_ratio_incl_skelp"] * 100).map("{:.2f}%".format),
                 textposition="bottom center",
                 textfont=dict(size=10, color=COLOR_SECONDARY),
                 hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
@@ -1892,10 +1921,8 @@ def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
     if links_df.empty:
         return {}
     confirmed = links_df[links_df["status"] == "confirmed"]
-    return {
-        row["project_sheet"]: f'{row["project_no"]} ({row["dimensions"]})'
-        for _, row in confirmed.iterrows()
-    }
+    labels = confirmed["project_no"].astype(str) + " (" + confirmed["dimensions"].astype(str) + ")"
+    return dict(zip(confirmed["project_sheet"], labels))
 
 
 @callback(
@@ -1930,12 +1957,18 @@ def load_pipe_sheets(_id, _import_result):
     Output("pipe-analysis-content", "children"),
     Input("pipe-sheet-dropdown", "value"),
     Input("unit-toggle", "value"),
+    Input("dashboard-tabs", "value"),
 )
-def render_pipe_analysis(selected_sheet, selected_unit):
+def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
     """Everything here is scoped to one selected project — cross-project
     overview material (daily repair pace, all-projects summary) lives on
     the Dashboard tab instead (see render_pipe_overview), so this tab stays
     a focused single-project drill-down."""
+    # Heavy (full pipe-details load + chart build) — skip while this tab
+    # isn't visible instead of rebuilding on every unit-toggle change made
+    # from another tab. Fires again once active_tab switches back here.
+    if active_tab != "tab-pipe":
+        return dash.no_update
     u = unit_label(selected_unit)
     if not selected_sheet:
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
@@ -2155,37 +2188,34 @@ def load_dimension_options(_id, _import_result):
 @callback(
     Output("dimension-detail-content", "children"),
     Input("dimension-detail-dropdown", "value"),
-    Input("unit-toggle", "value"),
-    Input("refresh-dashboard-btn", "n_clicks"),
-    Input("import-confirm-result", "children"),
+    Input("dashboard-stage-2", "data"),  # chained after pipe-overview-content, not parallel to it
+    State("unit-toggle", "value"),
+    prevent_initial_call=True,
 )
-def render_dimension_detail(selected_dimension, selected_unit, _n_clicks, _import_result):
+def render_dimension_detail(selected_dimension, _stage_2, selected_unit):
     if not selected_dimension:
         return _empty_state("No data available. Import an Excel file first.")
 
     master_df = load_master_data()
-    latest_date = master_df["date"].max()
-    latest_df = master_df[master_df["date"] == latest_date].copy()
-    latest_df = apply_meter_based_repair_ratios(latest_df)
+    latest_date, latest_df = _latest_day_frame(master_df)
     u = unit_label(selected_unit)
 
     # --- All-dimensions overview (moved here from the main Dashboard card
     # and the bubble-view-toggle, so every dimension-grouped chart lives
-    # together in one place instead of being split across two tabs). ---
-    overview_dim_df = (
-        latest_df.groupby("dimensions", as_index=False)
-        .agg(
-            total_repair_amount=("total_repair_amount", "sum"),
-            repaired_spiral_length=("repaired_spiral_length", "sum"),
-        )
-        .sort_values("total_repair_amount", ascending=False)
-        .head(15)
+    # together in one place instead of being split across two tabs). Ranked
+    # by weighted_ratio (not total_repair_amount) since that's the metric
+    # the chart actually displays — capping by volume first could silently
+    # drop a high-ratio, low-volume dimension the chart's own title implies
+    # would be shown.
+    overview_dim_df = latest_df.groupby("dimensions", as_index=False).agg(
+        total_repair_amount=("total_repair_amount", "sum"),
+        repaired_spiral_length=("repaired_spiral_length", "sum"),
     )
     overview_denom = overview_dim_df["repaired_spiral_length"] * METERS_PER_FOOT
     overview_dim_df["weighted_ratio"] = (
         overview_dim_df["total_repair_amount"] / overview_denom.where(overview_denom != 0)
     ).fillna(0)
-    overview_dim_df = overview_dim_df.sort_values("weighted_ratio", ascending=False)
+    overview_dim_df = overview_dim_df.sort_values("weighted_ratio", ascending=False).head(15)
     dimension_ratio_fig = px.bar(
         overview_dim_df,
         x="dimensions",
@@ -2236,9 +2266,7 @@ def render_dimension_detail(selected_dimension, selected_unit, _n_clicks, _impor
 
     # Repair-ratio chart — same clean (no 20XXQ- prefix) label as the
     # dashboard's ratio charts, with qty shown inside the bar instead.
-    dim_df["project_label_clean"] = dim_df.apply(
-        lambda r: _project_label_clean(r["project_no"], r["dimensions"]), axis=1
-    )
+    # project_label_clean already came along from latest_df (_latest_day_frame).
 
     dim_trend = daily_weighted_repair_ratios_for_dimension(master_df, selected_dimension).copy()
     dim_trend["weighted_repair_ratio"] = dim_trend["weighted_repair_ratio"].round(4)
@@ -2253,7 +2281,7 @@ def render_dimension_detail(selected_dimension, selected_unit, _n_clicks, _impor
             mode="lines+markers+text",
             name="Excl. Skelp",
             line=dict(color=COLOR_COIL, width=3),
-            text=(dim_trend["weighted_repair_ratio"] * 100).map(lambda v: f"{v:.2f}%"),
+            text=(dim_trend["weighted_repair_ratio"] * 100).map("{:.2f}%".format),
             textposition="top center",
             textfont=dict(size=10, color=COLOR_COIL),
             hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
@@ -2266,7 +2294,7 @@ def render_dimension_detail(selected_dimension, selected_unit, _n_clicks, _impor
             mode="lines+markers+text",
             name="Incl. Skelp",
             line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-            text=(dim_trend["weighted_repair_ratio_incl_skelp"] * 100).map(lambda v: f"{v:.2f}%"),
+            text=(dim_trend["weighted_repair_ratio_incl_skelp"] * 100).map("{:.2f}%".format),
             textposition="bottom center",
             textfont=dict(size=10, color=COLOR_SECONDARY),
             hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
