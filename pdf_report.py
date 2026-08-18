@@ -41,6 +41,7 @@ from calculations import (
     repair_amount_trend_data,
     unit_label,
 )
+from pipe_analysis import worst_pipes
 
 _ACCENT = "#2563eb"  # Coil / primary (matches dashboard COLOR_COIL)
 _ACCENT2 = "#f97316"  # Incl. skelp / impact / secondary (matches COLOR_SECONDARY)
@@ -53,17 +54,35 @@ _PAGE_MARGIN = 1.5 * cm
 _USABLE_WIDTH = landscape(A3)[0] - 2 * _PAGE_MARGIN
 _HALF_WIDTH = (_USABLE_WIDTH - 0.5 * cm) / 2
 
-# Keep these two in sync with the matching constants in pages/home.py — the
+# Keep these in sync with the matching constants in pages/home.py — the
 # PDF is a static mirror of the dashboard, rendered with a different
 # plotting library, so the values are duplicated rather than shared.
 TREND_WINDOW_DAYS = 20
 BUBBLE_LABEL_TOP_N = 5
+# See pages/home.py's PIPE_TREND_FLOOR_DATE for why: the initial bulk import
+# lump landed on 2026-07-24 and would otherwise dwarf real daily pipe counts.
+PIPE_TREND_FLOOR_DATE = pd.Timestamp("2026-08-03")
+# Pipe-level repair_category values (Coating vs Clutch) — colors the
+# production-order chart's markers, same mapping as pages/home.py's
+# _CATEGORY_COLORS.
+_CATEGORY_COLORS = {"Coating": _ACCENT, "Clutch": _ACCENT2}
 
 
 def _strip_quarter_prefix(project_no) -> str:
     """'2026Q-10-108JT' -> '10-108JT' — same "20XXQ-" strip the dashboard's
     repair-ratio charts use, so the PDF axis labels match."""
     return re.sub(r"^\d{4}Q-", "", str(project_no))
+
+
+def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
+    """project_sheet -> "project_no (dimensions)" for confirmed mappings —
+    duplicate of pages/home.py's _pipe_sheet_label_map, same reasoning as
+    the other constants above."""
+    if links_df.empty:
+        return {}
+    confirmed = links_df[links_df["status"] == "confirmed"]
+    labels = confirmed["project_no"].astype(str) + " (" + confirmed["dimensions"].astype(str) + ")"
+    return dict(zip(confirmed["project_sheet"], labels))
 
 
 def _add_bar_value_annotations(ax, positions, values, display_values, min_fraction: float = 0.15) -> None:
@@ -237,6 +256,44 @@ def _amount_chart(daily_amount: pd.DataFrame, unit: str) -> Image:
     _style_axes(ax, f"Daily Repair Amount ({unit})")
     _date_axis(ax)
     fig.tight_layout()
+    return _figure_to_image(fig, _USABLE_WIDTH)
+
+
+def _daily_pipe_count_chart(pipe_df: pd.DataFrame, links_df: pd.DataFrame) -> Image | None:
+    """Pipes repaired per day across every mapped project — mirrors the
+    dashboard's "Pipes Repaired per Day" chart (pages/home.py, render_dashboard).
+    Returns None (skipped by the caller) if there's no mapped pipe data yet,
+    same as the dashboard's own daily_pipe_fig."""
+    if pipe_df.empty:
+        return None
+    label_map = _pipe_sheet_label_map(links_df)
+    mapped_df = pipe_df[pipe_df["project_sheet"].isin(label_map)]
+    if mapped_df.empty:
+        return None
+
+    window_start = max(
+        mapped_df["first_seen_date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS),
+        PIPE_TREND_FLOOR_DATE,
+    )
+    daily_counts = (
+        mapped_df[mapped_df["first_seen_date"] >= window_start]
+        .groupby(mapped_df["first_seen_date"].dt.date)
+        .size()
+        .reset_index(name="count")
+        .rename(columns={"first_seen_date": "date"})
+    )
+    daily_counts["date"] = pd.to_datetime(daily_counts["date"])
+
+    fig, ax = plt.subplots(figsize=(14, 3.6))
+    ax.bar(daily_counts["date"], daily_counts["count"], color=_ACCENT2)
+    ax.set_ylabel("Pipes Repaired")
+    _style_axes(ax, "Pipes Repaired per Day (All Projects)")
+    _date_axis(ax)
+    fig.tight_layout()
+    max_count = daily_counts["count"].max()
+    headroom = max_count * 0.03 if max_count else 0.1
+    for x, count in zip(daily_counts["date"], daily_counts["count"]):
+        ax.text(x, count + headroom, str(count), ha="center", fontsize=8)
     return _figure_to_image(fig, _USABLE_WIDTH)
 
 
@@ -541,12 +598,21 @@ def _side_by_side(left: Image, right: Image) -> Table:
     return row
 
 
-def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selected_date, display_unit: str = "m") -> bytes:
+def build_pdf_report(
+    master_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
+    selected_date,
+    display_unit: str = "m",
+    pipe_df: pd.DataFrame | None = None,
+    links_df: pd.DataFrame | None = None,
+) -> bytes:
     """Build an A3-landscape PDF report for the given report date.
 
     `master_df` is the same frame used to render the dashboard (see
     pages/home.py:render_dashboard). `display_unit` ("m" or "ft") mirrors
-    the dashboard's unit toggle at the time the PDF was requested.
+    the dashboard's unit toggle at the time the PDF was requested. `pipe_df`/
+    `links_df` (pipe_repair_details / project_sheet_links) are optional —
+    only used for the "Pipes Repaired per Day" chart, skipped if omitted.
     """
     u = unit_label(display_unit)
     latest_df = master_df[master_df["date"] == selected_date].copy()
@@ -578,6 +644,10 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
         else 0
     )
     daily_amount = repair_amount_trend_data(master_df, display_unit=display_unit)
+    daily_pipe_img = _daily_pipe_count_chart(
+        pipe_df if pipe_df is not None else pd.DataFrame(),
+        links_df if links_df is not None else pd.DataFrame(),
+    )
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -650,10 +720,184 @@ def build_pdf_report(master_df: pd.DataFrame, baseline_df: pd.DataFrame, selecte
         _dimension_ratio_chart(master_df, selected_date),
         Spacer(1, 0.3 * cm),
         _amount_chart(daily_amount, u),
+    ] + (
+        [Spacer(1, 0.3 * cm), daily_pipe_img] if daily_pipe_img is not None else []
+    ) + [
         Spacer(1, 0.5 * cm),
         Paragraph("Latest Day — Project Details", section_style),
         Spacer(1, 0.2 * cm),
         _detail_table(latest_df),
+    ]
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Pipe Analysis PDF — same idea, scoped to one selected project's pipe-level
+# data instead of the cross-project daily snapshot above. Mirrors the Pipe
+# Analysis tab (pages/home.py, render_pipe_analysis).
+# ---------------------------------------------------------------------------
+
+def _pipe_worst_chart(sheet_df: pd.DataFrame, sheet_label: str) -> Image:
+    worst = worst_pipes(sheet_df, top_n=15)
+    fig, ax = plt.subplots(figsize=(14, 3.6))
+    x = range(len(worst))
+    ax.bar(x, worst["repair_ratio"], color=_ACCENT)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(worst["pipe_no"].astype(int).astype(str), fontsize=8)
+    ax.set_xlabel("Pipe No.")
+    ax.set_ylabel("Repair Ratio")
+    _style_axes(ax, f"Top 15 Pipes by Repair Ratio — {sheet_label}")
+    fig.tight_layout()
+    values = worst["repair_ratio"]
+    max_ratio = values.max() if len(values) else 0
+    headroom = max_ratio * 0.03 if max_ratio else 0.1
+    for xi, value in zip(x, values):
+        ax.text(xi, value + headroom, f"{value:.2%}", ha="center", fontsize=8)
+    if max_ratio:
+        ax.set_ylim(top=max_ratio * 1.15)
+    return _figure_to_image(fig, _USABLE_WIDTH)
+
+
+def _pipe_sequence_chart(sheet_df: pd.DataFrame, sheet_label: str) -> Image:
+    """Repair ratio in production order (pipe_no), marker-colored by
+    repair_category, with a centered rolling average on top — mirrors
+    render_pipe_analysis's sequence_fig exactly (same window/min_periods)."""
+    fig, ax = plt.subplots(figsize=(14, 3.6))
+    point_colors = [_CATEGORY_COLORS.get(c, _ACCENT) for c in sheet_df["repair_category"]]
+    ax.plot(sheet_df["pipe_no"], sheet_df["repair_ratio"], color=_ACCENT, linewidth=1, zorder=1)
+    ax.scatter(sheet_df["pipe_no"], sheet_df["repair_ratio"], c=point_colors, s=18, zorder=2)
+    rolling_window = 10
+    rolling_avg = sheet_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
+    ax.plot(
+        sheet_df["pipe_no"], rolling_avg, color=_ACCENT2, linewidth=2, linestyle="--",
+        label=f"{rolling_window}-Pipe Rolling Avg",
+    )
+    ax.set_xlabel("Pipe No. (Production Order)")
+    ax.set_ylabel("Repair Ratio")
+    ax.legend(fontsize=9, frameon=False)
+    _style_axes(ax, f"Repair Ratio by Production Order — {sheet_label}")
+    fig.tight_layout()
+    return _figure_to_image(fig, _USABLE_WIDTH)
+
+
+def _pipe_box_chart(sheet_df: pd.DataFrame, sheet_label: str) -> Image:
+    """One project's repair-ratio distribution — mirrors _build_box_fig's
+    styling (pages/home.py): light blue box/median, dashed mean line,
+    orange outlier points."""
+    values = (sheet_df["repair_ratio"] * 100).dropna()
+    fig, ax = plt.subplots(figsize=(6, 4.2))
+    ax.boxplot(
+        [values],
+        positions=[0],
+        widths=0.4,
+        patch_artist=True,
+        showmeans=True,
+        meanline=True,
+        boxprops=dict(facecolor="#dbeafe", edgecolor=_ACCENT, linewidth=1.5),
+        medianprops=dict(color=_ACCENT, linewidth=1.5),
+        meanprops=dict(color=_ACCENT2, linewidth=1.5, linestyle="--"),
+        whiskerprops=dict(color=_ACCENT),
+        capprops=dict(color=_ACCENT),
+        flierprops=dict(marker="o", markerfacecolor=_ACCENT2, markeredgecolor=_ACCENT2, markersize=5, alpha=0.85),
+    )
+    ax.set_xticks([0])
+    ax.set_xticklabels([sheet_label], fontsize=9)
+    ax.set_ylabel("Repair Ratio (%)")
+    _style_axes(ax, f"Repair Ratio Distribution — {sheet_label}")
+    fig.tight_layout()
+    img = _figure_to_image(fig, _HALF_WIDTH)
+    img.hAlign = "CENTER"
+    return img
+
+
+def _pipe_detail_table(sheet_df: pd.DataFrame, unit: str) -> Table:
+    columns = ["id", "block_cell", "pipe_no", "pipe_length_ft", "repair_amount", "repair_ratio", "repair_count"]
+    header = ["Id", "Cell Ref.", "Pipe No.", f"Pipe Length ({unit})", f"Repair Amount ({unit})", "Repair Ratio", "B.E Count"]
+    ordered = sheet_df[columns].sort_values("pipe_no")
+    formatted = pd.DataFrame(
+        {
+            "id": ordered["id"].astype(int).astype(str),
+            "block_cell": ordered["block_cell"].astype(str),
+            "pipe_no": ordered["pipe_no"].astype(int).astype(str),
+            "pipe_length_ft": ordered["pipe_length_ft"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-"),
+            "repair_amount": ordered["repair_amount"].map("{:.2f}".format),
+            "repair_ratio": ordered["repair_ratio"].map("{:.2%}".format),
+            "repair_count": ordered["repair_count"].map(lambda v: str(int(v)) if pd.notna(v) else "-"),
+        }
+    )
+    data = [header] + formatted.values.tolist()
+
+    col_fractions = [0.08, 0.16, 0.12, 0.18, 0.18, 0.14, 0.14]
+    col_widths = [_USABLE_WIDTH * f for f in col_fractions]
+
+    table = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(_ACCENT)),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor(_GRID)),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(_ROW_ALT)]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    return table
+
+
+def build_pipe_analysis_pdf_report(sheet_label: str, sheet_df: pd.DataFrame, display_unit: str = "m") -> bytes:
+    """Build an A3-landscape PDF for one project's pipe-level data — the
+    Pipe Analysis tab's counterpart to build_pdf_report above.
+
+    `sheet_df` is the already-filtered (one project_sheet) frame from
+    load_pipe_repair_details(); `display_unit` mirrors the dashboard's unit
+    toggle at request time.
+    """
+    u = unit_label(display_unit)
+    sheet_df = sheet_df.sort_values("pipe_no").copy()
+    if "pipe_length_ft" in sheet_df.columns:
+        sheet_df["pipe_length_ft"] = length_in_display_unit(sheet_df["pipe_length_ft"], display_unit)
+    if "repair_amount" in sheet_df.columns:
+        sheet_df["repair_amount"] = amount_in_display_unit(sheet_df["repair_amount"], display_unit)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A3),
+        leftMargin=_PAGE_MARGIN,
+        rightMargin=_PAGE_MARGIN,
+        topMargin=_PAGE_MARGIN,
+        bottomMargin=_PAGE_MARGIN,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"], fontSize=20, spaceAfter=4)
+    subtitle_style = ParagraphStyle("ReportSubtitle", parent=styles["Normal"], fontSize=12, textColor=colors.HexColor("#64748b"))
+    section_style = styles["Heading2"]
+
+    date_range = ""
+    if "first_seen_date" in sheet_df.columns and not sheet_df.empty:
+        first = pd.to_datetime(sheet_df["first_seen_date"]).min().strftime("%d.%m.%Y")
+        last = pd.to_datetime(sheet_df["first_seen_date"]).max().strftime("%d.%m.%Y")
+        date_range = f"  |  Activity: {first} – {last}"
+
+    story = [
+        Paragraph(f"Pipe Detail Report — {sheet_label}", title_style),
+        Paragraph(f"Pipes: {len(sheet_df)}{date_range}", subtitle_style),
+        Spacer(1, 0.4 * cm),
+        _pipe_worst_chart(sheet_df, sheet_label),
+        Spacer(1, 0.3 * cm),
+        _pipe_sequence_chart(sheet_df, sheet_label),
+        Spacer(1, 0.3 * cm),
+        _pipe_box_chart(sheet_df, sheet_label),
+        Spacer(1, 0.5 * cm),
+        Paragraph("Pipe Details", section_style),
+        Spacer(1, 0.2 * cm),
+        _pipe_detail_table(sheet_df, u),
     ]
     doc.build(story)
     return buffer.getvalue()

@@ -51,7 +51,7 @@ from database import (
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate, parse_repair_rate_archive
-from pdf_report import build_pdf_report
+from pdf_report import build_pdf_report, build_pipe_analysis_pdf_report
 from pipe_analysis import worst_pipes
 from project_parser import parse_project_pipe_repairs
 from validators import mark_duplicate_counts
@@ -362,39 +362,16 @@ def layout():
                         children=[
                             html.Section(
                                 [
-                                    html.H2("Pipe-Level Analysis"),
+                                    html.H2("Project Trend"),
                                     html.P(
-                                        "Per-pipe repair data parsed from each project sheet during "
-                                        "Excel import. Pick a project to see everything about it.",
+                                        "Pick a project to see its repair ratio over all report dates, and "
+                                        "everything about its pipes below.",
                                         className="help-text",
                                     ),
                                     html.Div(
                                         [
                                             html.Div(
                                                 [html.Label("Project"), dcc.Dropdown(id="pipe-sheet-dropdown")],
-                                                className="filter-field",
-                                            ),
-                                        ],
-                                        className="filter-row",
-                                    ),
-                                    dcc.Loading(html.Div(id="pipe-analysis-content")),
-                                ],
-                                className="card",
-                            ),
-                            html.Section(
-                                [
-                                    html.H2("Project Trend"),
-                                    html.P(
-                                        "Select a project + dimensions to see its repair ratio over all report dates.",
-                                        className="help-text",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                [
-                                                    html.Label("Project (Dimensions)"),
-                                                    dcc.Dropdown(id="project-trend-dropdown"),
-                                                ],
                                                 className="filter-field",
                                             ),
                                             html.Div(
@@ -412,10 +389,50 @@ def layout():
                                                 ],
                                                 className="filter-field",
                                             ),
+                                            html.Div(
+                                                [
+                                                    html.Label("Timeline"),
+                                                    dcc.Checklist(
+                                                        id="project-trend-compact-toggle",
+                                                        options=[
+                                                            {
+                                                                "label": "Compact Timeline (collapse empty days)",
+                                                                "value": "compact",
+                                                            }
+                                                        ],
+                                                        value=["compact"],
+                                                        inline=True,
+                                                    ),
+                                                ],
+                                                className="filter-field",
+                                            ),
                                         ],
                                         className="filter-row",
                                     ),
                                     dcc.Loading(html.Div(id="project-trend-content")),
+                                ],
+                                className="card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div(
+                                        [
+                                            html.H2("Pipe-Level Analysis"),
+                                            html.Button(
+                                                "Download PDF Report",
+                                                id="download-pipe-pdf-btn",
+                                                className="secondary-btn",
+                                            ),
+                                        ],
+                                        className="section-header-row",
+                                    ),
+                                    html.P(
+                                        "Per-pipe repair data parsed from each project sheet during Excel import "
+                                        "for whichever project is selected above.",
+                                        className="help-text",
+                                    ),
+                                    dcc.Download(id="pipe-pdf-download"),
+                                    dcc.Loading(html.Div(id="pipe-analysis-content")),
                                 ],
                                 className="card",
                             ),
@@ -747,9 +764,41 @@ def download_pdf_report(n_clicks, selected_unit):
         return dash.no_update
 
     baseline_df = load_historical_baselines()
+    pipe_df = load_pipe_repair_details()
+    links_df = load_project_sheet_links()
     latest_date = master_df["date"].max()
-    pdf_bytes = build_pdf_report(master_df, baseline_df, latest_date, display_unit=selected_unit)
+    pdf_bytes = build_pdf_report(
+        master_df, baseline_df, latest_date, display_unit=selected_unit, pipe_df=pipe_df, links_df=links_df
+    )
     filename = f"repair_rate_report_{latest_date.date().isoformat()}.pdf"
+
+    return dcc.send_bytes(pdf_bytes, filename)
+
+
+@callback(
+    Output("pipe-pdf-download", "data"),
+    Input("download-pipe-pdf-btn", "n_clicks"),
+    State("pipe-sheet-dropdown", "value"),
+    State("unit-toggle", "value"),
+    prevent_initial_call=True,
+)
+def download_pipe_analysis_pdf(n_clicks, selected_sheet, selected_unit):
+    if not n_clicks or not selected_sheet:
+        return dash.no_update
+
+    df = load_pipe_repair_details()
+    if df.empty:
+        return dash.no_update
+
+    links_df = load_project_sheet_links()
+    label_map = _pipe_sheet_label_map(links_df)
+    sheet_df = df[df["project_sheet"] == selected_sheet].sort_values("pipe_no")
+    if sheet_df.empty:
+        return dash.no_update
+
+    sheet_label = label_map.get(selected_sheet, selected_sheet)
+    pdf_bytes = build_pipe_analysis_pdf_report(sheet_label, sheet_df, display_unit=selected_unit)
+    filename = f"pipe_report_{selected_sheet}.pdf".replace(" ", "_")
 
     return dcc.send_bytes(pdf_bytes, filename)
 
@@ -1791,54 +1840,77 @@ def render_type_trend_chart(selected_types, _stage_1):
     return dcc.Graph(figure=fig)
 
 
-# ---------------------------------------------------------------------------
-# Callback X1: Project Trend — populate the project dropdown
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("project-trend-dropdown", "options"),
-    Output("project-trend-dropdown", "value"),
-    Input("project-trend-dropdown", "id"),  # fires once, on page load
-    Input("import-confirm-result", "children"),  # refresh after a new import
-)
-def load_project_trend_options(_id, _import_result):
-    master_df = load_master_data()
-    if master_df.empty:
-        return [], None
-    # A project_no alone isn't unique — the same project can carry several
-    # dimensions (e.g. "2026Q-10-108JT" spans 7 different dimensions in the
-    # real data). Offer project + dimensions as one combined choice so the
-    # trend line below is never built from mismatched dimension rows.
-    combos = (
-        master_df[["project_no", "dimensions"]]
-        .dropna()
-        .drop_duplicates()
-        .sort_values(["project_no", "dimensions"])
-    )
-    options = [
-        {"label": f"{row.project_no} ({row.dimensions})", "value": f"{row.project_no}||{row.dimensions}"}
-        for row in combos.itertuples(index=False)
-    ]
-    return options, options[0]["value"] if options else None
+def _collapse_unchanged_days(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """Keep a row only where value_col changed from the previous day, plus
+    always the first and last. A project can go untouched for days —
+    repair_rates stores cumulative totals, so an untouched day's row repeats
+    the previous report's value byte-for-byte — and plotting every one of
+    those as a "new" point makes the line look busier than the underlying
+    activity actually was."""
+    if df.empty:
+        return df
+    changed = df[value_col].ne(df[value_col].shift())
+    changed.iloc[0] = True
+    changed.iloc[-1] = True  # always show through to the most recent date
+    return df[changed]
 
 
+def _gap_annotations(df: pd.DataFrame, value_col: str, date_index: dict, color: str, yshift: int) -> list[dict]:
+    """'+N days' labels wherever _collapse_unchanged_days skipped more than
+    one calendar day between two consecutive kept points — otherwise, once
+    the axis is categorical (only kept dates get a tick), a two-day gap and
+    a three-week gap look identical, since neither draws any empty axis
+    space anymore. Positioned at the fractional category-index midpoint
+    between the two points (a plain number, not a category label, is how
+    Plotly places something *between* two ticks on a category axis)."""
+    annotations = []
+    dates = df["date"].tolist()
+    values = (df[value_col] * 100).tolist()
+    for i in range(1, len(dates)):
+        gap_days = (dates[i] - dates[i - 1]).days
+        if gap_days > 1:
+            annotations.append(
+                dict(
+                    x=(date_index[dates[i - 1]] + date_index[dates[i]]) / 2,
+                    y=(values[i - 1] + values[i]) / 2,
+                    xref="x",
+                    yref="y",
+                    text=f"+{gap_days} days",
+                    showarrow=False,
+                    font=dict(size=9, color=color),
+                    yshift=yshift,
+                )
+            )
+    return annotations
+
+
 # ---------------------------------------------------------------------------
-# Callback X2: Project Trend — render the trend chart for the selected project
+# Callback: Project Trend — render the trend chart for the selected project
+# (shares pipe-sheet-dropdown with Pipe-Level Analysis below — one project
+# picker, not two, since the pipe-level tables were already the narrower/
+# more relevant list).
 # ---------------------------------------------------------------------------
 
 @callback(
     Output("project-trend-content", "children"),
-    Input("project-trend-dropdown", "value"),
+    Input("pipe-sheet-dropdown", "value"),
     Input("project-trend-checklist", "value"),
+    Input("project-trend-compact-toggle", "value"),
     Input("dashboard-tabs", "value"),
 )
-def render_project_trend(selected_value, selected_series, active_tab):
+def render_project_trend(selected_sheet, selected_series, compact_toggle, active_tab):
     if active_tab != "tab-pipe":
         return dash.no_update
-    if not selected_value or not selected_series:
+    if not selected_sheet or not selected_series:
         return _empty_state("No data available. Import an Excel file first.")
 
-    project_no, _, dimensions = selected_value.partition("||")
+    links_df = load_project_sheet_links()
+    match = links_df[(links_df["project_sheet"] == selected_sheet) & (links_df["status"] == "confirmed")]
+    if match.empty:
+        return _empty_state("No confirmed project mapping for this sheet yet.")
+    project_no = match.iloc[0]["project_no"]
+    dimensions = match.iloc[0]["dimensions"]
+
     master_df = load_master_data()
     project_df = master_df[
         (master_df["project_no"] == project_no) & (master_df["dimensions"] == dimensions)
@@ -1852,42 +1924,83 @@ def render_project_trend(selected_value, selected_series, active_tab):
     window_start = project_df["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
     project_df = project_df[project_df["date"] >= window_start]
 
-    fig = go.Figure()
+    # Compact: drop days where the ratio didn't change (a project can go
+    # untouched for days — see _collapse_unchanged_days) and use a
+    # categorical axis so those empty days don't stretch the line across
+    # axis space that has no data in it; a "+N days" annotation marks any
+    # gap over a day so that missing time isn't just silently invisible.
+    # Full: the plain, unmodified calendar-date view — every report date,
+    # real date-scale spacing, no collapsing.
+    compact = "compact" in (compact_toggle or [])
+    excl_df = None
+    incl_df = None
     if "Excl" in selected_series:
+        excl_df = _collapse_unchanged_days(project_df, "repair_ratio") if compact else project_df
+    if "Incl" in selected_series:
+        incl_df = _collapse_unchanged_days(project_df, "repair_ratio_incl_skelp") if compact else project_df
+
+    date_labels: dict = {}
+    if compact:
+        all_dates = sorted(
+            set(excl_df["date"].tolist() if excl_df is not None else [])
+            | set(incl_df["date"].tolist() if incl_df is not None else [])
+        )
+        date_labels = {d: d.strftime("%d.%m.%y") for d in all_dates}
+        date_index = {d: i for i, d in enumerate(all_dates)}
+
+    fig = go.Figure()
+    annotations = []
+    hover_x = "%{x}" if compact else "%{x|%d.%m.%Y}"
+
+    if excl_df is not None:
+        excl_x = [date_labels[d] for d in excl_df["date"]] if compact else excl_df["date"]
         fig.add_trace(
             go.Scatter(
-                x=project_df["date"],
-                y=project_df["repair_ratio"] * 100,
+                x=excl_x,
+                y=excl_df["repair_ratio"] * 100,
                 mode="lines+markers+text",
                 name="Excl. Skelp",
                 line=dict(color=COLOR_COIL, width=3),
-                text=(project_df["repair_ratio"] * 100).map("{:.2f}%".format),
+                text=(excl_df["repair_ratio"] * 100).map("{:.2f}%".format),
                 textposition="top center",
                 textfont=dict(size=10, color=COLOR_COIL),
-                hovertemplate="%{x|%d.%m.%Y}<br>Excl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+                hovertemplate=f"{hover_x}<br>Excl. Skelp: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
-    if "Incl" in selected_series:
+        if compact:
+            annotations += _gap_annotations(excl_df, "repair_ratio", date_index, COLOR_MUTED, yshift=22)
+    if incl_df is not None:
+        incl_x = [date_labels[d] for d in incl_df["date"]] if compact else incl_df["date"]
         fig.add_trace(
             go.Scatter(
-                x=project_df["date"],
-                y=project_df["repair_ratio_incl_skelp"] * 100,
+                x=incl_x,
+                y=incl_df["repair_ratio_incl_skelp"] * 100,
                 mode="lines+markers+text",
                 name="Incl. Skelp",
                 line=dict(color=COLOR_SECONDARY, width=3, dash="dash"),
-                text=(project_df["repair_ratio_incl_skelp"] * 100).map("{:.2f}%".format),
+                text=(incl_df["repair_ratio_incl_skelp"] * 100).map("{:.2f}%".format),
                 textposition="bottom center",
                 textfont=dict(size=10, color=COLOR_SECONDARY),
-                hovertemplate="%{x|%d.%m.%Y}<br>Incl. Skelp: <b>%{y:.2f}%</b><extra></extra>",
+                hovertemplate=f"{hover_x}<br>Incl. Skelp: <b>%{{y:.2f}}%</b><extra></extra>",
             )
         )
+        if compact:
+            annotations += _gap_annotations(incl_df, "repair_ratio_incl_skelp", date_index, COLOR_MUTED, yshift=-22)
 
     # Same rule as the other trend charts: only draw a trend line when a
-    # single series is isolated.
+    # single series is isolated. The fit itself always uses the full
+    # (uncollapsed) project_df so a long flat stretch is weighted by its
+    # real duration; in compact mode only its two endpoints get plotted,
+    # since the categorical axis only has categories for the dates above
+    # and a straight line needs no more than its endpoints anyway.
     if len(selected_series) == 1:
         value_col = "repair_ratio" if selected_series[0] == "Excl" else "repair_ratio_incl_skelp"
         trend_trace = _build_trend_trace(project_df, value_col)
         if trend_trace is not None:
+            if compact:
+                start_date, end_date = project_df["date"].min(), project_df["date"].max()
+                trend_trace.x = [date_labels[start_date], date_labels[end_date]]
+                trend_trace.y = [trend_trace.y[0], trend_trace.y[-1]]
             fig.add_trace(trend_trace)
 
     if len(selected_series) == 2:
@@ -1904,8 +2017,13 @@ def render_project_trend(selected_value, selected_series, active_tab):
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
+        annotations=annotations,
     )
-    fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
+    if compact:
+        all_date_labels = [date_labels[d] for d in sorted(date_labels)]
+        fig.update_xaxes(type="category", categoryorder="array", categoryarray=all_date_labels, tickangle=-45)
+    else:
+        fig.update_xaxes(type="date", tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
     return dcc.Graph(figure=fig)
 
@@ -2030,7 +2148,7 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
     # trending worse toward the start or end of the run" readable without
     # eyeballing every scattered point. min_periods=1 keeps this
     # well-behaved even on a 1-pipe sheet.
-    rolling_window = 10
+    rolling_window = 8 # at least 3 pipes, or 10% of the run
     rolling_avg = sheet_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
     sequence_fig.add_trace(
         go.Scatter(
@@ -2043,8 +2161,8 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         )
     )
     sequence_fig.update_layout(
-        title=f"Repair Ratio by Production Order — {sheet_label}",
-        xaxis_title="Pipe No. (Production Order)",
+        title=f"Repair Ratio by Production Number — {sheet_label}",
+        xaxis_title="Pipe No.",
         yaxis_title="Repair Ratio",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
