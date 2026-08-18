@@ -43,11 +43,9 @@ from database import (
     load_historical_baselines,
     load_master_data,
     load_pipe_repair_details,
-    load_project_group_config,
     load_project_sheet_links,
     upsert_historical_baselines,
     upsert_pipe_repair_details,
-    upsert_project_group_config,
     upsert_repair_rates,
 )
 from parser import parse_daily_repair_rate, parse_repair_rate_archive
@@ -149,6 +147,7 @@ TEXT_COLUMNS = {
     "date",
     "project_no",
     "project",
+    "label",
     "dimensions",
     "project_status",
     "production_type",
@@ -439,48 +438,56 @@ def layout():
                         ],
                     ),
                     dcc.Tab(
-                        label="Project Grouping",
-                        value="tab-groups",
+                        label="Comparison",
+                        value="tab-comparison",
                         style=_TAB_STYLE,
                         selected_style=_TAB_SELECTED_STYLE,
                         children=[
                             html.Section(
                                 [
-                                    html.H2("Project Grouping"),
+                                    html.H2("Comparison"),
                                     html.P(
-                                        "Define named pipe-number ranges for a project sheet, for use in "
-                                        "group-level analysis. Format: \"1-20:Group A; 21-45:Group B\".",
+                                        "Select two or more projects to compare their repair ratio, trend, "
+                                        "and pipe-level spread side by side.",
                                         className="help-text",
                                     ),
                                     html.Div(
                                         [
                                             html.Div(
-                                                [html.Label("Project Sheet"), dcc.Dropdown(id="group-sheet-dropdown")],
+                                                [
+                                                    html.Label("Projects"),
+                                                    dcc.Dropdown(id="comparison-project-dropdown", multi=True),
+                                                ],
                                                 className="filter-field",
                                             ),
-                                        ],
-                                        className="filter-row",
-                                    ),
-                                    html.Div(
-                                        [
                                             html.Div(
                                                 [
-                                                    html.Label("Pipe Groups"),
-                                                    dcc.Textarea(
-                                                        id="pipe-groups-input",
-                                                        placeholder="e.g. 1-20:Team A; 21-45:Team B",
-                                                        className="group-textarea",
+                                                    html.Label("Series"),
+                                                    dcc.Checklist(
+                                                        id="comparison-series-checklist",
+                                                        options=[
+                                                            {"label": "Excl. Skelp", "value": "Excl"},
+                                                            {"label": "Incl. Skelp", "value": "Incl"},
+                                                        ],
+                                                        value=["Excl"],
+                                                        inline=True,
                                                     ),
                                                 ],
                                                 className="filter-field",
                                             ),
                                             html.Div(
                                                 [
-                                                    html.Label("Machine Groups"),
-                                                    dcc.Textarea(
-                                                        id="machine-groups-input",
-                                                        placeholder="e.g. 1-30:Machine 1; 31-60:Machine 2",
-                                                        className="group-textarea",
+                                                    html.Label("Timeline"),
+                                                    dcc.Checklist(
+                                                        id="comparison-compact-toggle",
+                                                        options=[
+                                                            {
+                                                                "label": "Compact Timeline (collapse empty days)",
+                                                                "value": "compact",
+                                                            }
+                                                        ],
+                                                        value=["compact"],
+                                                        inline=True,
                                                     ),
                                                 ],
                                                 className="filter-field",
@@ -488,8 +495,7 @@ def layout():
                                         ],
                                         className="filter-row",
                                     ),
-                                    html.Button("Save Groups", id="save-groups-btn", className="primary-btn"),
-                                    html.Div(id="save-groups-result"),
+                                    dcc.Loading(html.Div(id="comparison-content")),
                                 ],
                                 className="card",
                             ),
@@ -1908,7 +1914,10 @@ def render_project_trend(selected_sheet, selected_series, compact_toggle, active
     match = links_df[(links_df["project_sheet"] == selected_sheet) & (links_df["status"] == "confirmed")]
     if match.empty:
         return _empty_state("No confirmed project mapping for this sheet yet.")
-    project_no = match.iloc[0]["project_no"]
+    # .strip(): at least one confirmed mapping carries stray whitespace in
+    # its project_no ("2025Q-10-108JT   "), which would otherwise silently
+    # fail to match anything in master_df below.
+    project_no = str(match.iloc[0]["project_no"]).strip()
     dimensions = match.iloc[0]["dimensions"]
 
     master_df = load_master_data()
@@ -2222,60 +2231,307 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
 
 
 # ---------------------------------------------------------------------------
-# Callback 8: Project Grouping — populate the project sheet dropdown
+# Callback: Comparison — populate the multi-select project dropdown
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("group-sheet-dropdown", "options"),
-    Output("group-sheet-dropdown", "value"),
-    Input("group-sheet-dropdown", "id"),  # fires once, on page load
+    Output("comparison-project-dropdown", "options"),
+    Output("comparison-project-dropdown", "value"),
+    Input("comparison-project-dropdown", "id"),  # fires once, on page load
+    Input("import-confirm-result", "children"),  # refresh after a new import
 )
-def load_group_sheets(_id):
-    df = load_pipe_repair_details()
-    if df.empty:
-        return [], None
-    sheets = sorted(df["project_sheet"].unique())
-    options = [{"label": s, "value": s} for s in sheets]
-    return options, options[0]["value"] if options else None
+def load_comparison_options(_id, _import_result):
+    links_df = load_project_sheet_links()
+    label_map = _pipe_sheet_label_map(links_df)
+    pipe_df = load_pipe_repair_details()
+    if pipe_df.empty or not label_map:
+        return [], []
+    sheets = set(pipe_df["project_sheet"].unique())
+    mapped_sheets = sorted(sheets & label_map.keys(), key=lambda s: label_map[s])
+    options = [{"label": label_map[s], "value": s} for s in mapped_sheets]
+    # Pre-select the first two so the tab shows a working comparison right
+    # away instead of an empty "pick something" state.
+    return options, [o["value"] for o in options[:2]]
 
 
 # ---------------------------------------------------------------------------
-# Callback 9: Project Grouping — load the saved config for a sheet
+# Callback: Comparison — trend/ratio/spread charts + table for the selected
+# projects. Every chart here reuses an existing builder (the skelp-impact
+# stacked bar, the per-project trend line, _build_box_fig) rather than
+# inventing new plotting logic — see the plan doc for why each was picked.
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("pipe-groups-input", "value"),
-    Output("machine-groups-input", "value"),
-    Output("save-groups-result", "children", allow_duplicate=True),
-    Input("group-sheet-dropdown", "value"),
-    prevent_initial_call=True,
+    Output("comparison-content", "children"),
+    Input("comparison-project-dropdown", "value"),
+    Input("comparison-series-checklist", "value"),
+    Input("comparison-compact-toggle", "value"),
+    Input("unit-toggle", "value"),
+    Input("dashboard-tabs", "value"),
 )
-def load_group_config(selected_sheet):
-    if not selected_sheet:
-        return "", "", None
-    config = load_project_group_config(selected_sheet, selected_sheet, "")
-    if not config:
-        return "", "", None
-    return config.get("pipe_groups", ""), config.get("machine_groups", ""), None
-
-
-# ---------------------------------------------------------------------------
-# Callback 10: Project Grouping — save the group spec for a sheet
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("save-groups-result", "children"),
-    Input("save-groups-btn", "n_clicks"),
-    State("group-sheet-dropdown", "value"),
-    State("pipe-groups-input", "value"),
-    State("machine-groups-input", "value"),
-    prevent_initial_call=True,
-)
-def save_groups(n_clicks, selected_sheet, pipe_groups, machine_groups):
-    if not n_clicks or not selected_sheet:
+def render_comparison(selected_sheets, selected_series, compact_toggle, selected_unit, active_tab):
+    if active_tab != "tab-comparison":
         return dash.no_update
-    upsert_project_group_config(selected_sheet, selected_sheet, "", pipe_groups or "", machine_groups or "")
-    return html.Div(f"✅ Groups saved for {selected_sheet}.", className="success-text")
+    selected_sheets = selected_sheets or []
+    if len(selected_sheets) < 2:
+        return _empty_state("Select at least two projects to compare.")
+
+    links_df = load_project_sheet_links()
+    confirmed = links_df[links_df["status"] == "confirmed"]
+    master_df = load_master_data()
+    pipe_df = load_pipe_repair_details()
+    u = unit_label(selected_unit)
+
+    projects = []
+    for sheet in selected_sheets:
+        match = confirmed[confirmed["project_sheet"] == sheet]
+        if match.empty:
+            continue
+        # .strip(): at least one confirmed mapping carries stray whitespace
+        # in its project_no ("2025Q-10-108JT   "), which would otherwise
+        # silently fail to match anything in master_df below.
+        project_no = str(match.iloc[0]["project_no"]).strip()
+        dimensions = match.iloc[0]["dimensions"]
+        stripped_project_no = re.sub(r"^\d{4}Q-", "", project_no)
+        label = f"{stripped_project_no} ({dimensions})"
+        projects.append({"sheet": sheet, "project_no": project_no, "dimensions": dimensions, "label": label})
+    if len(projects) < 2:
+        return _empty_state("Select at least two projects to compare.")
+    projects_df = pd.DataFrame(projects)
+
+    mask = pd.Series(False, index=master_df.index)
+    for p in projects:
+        mask |= (master_df["project_no"] == p["project_no"]) & (master_df["dimensions"] == p["dimensions"])
+    selected_master_df = apply_meter_based_repair_ratios(master_df[mask].copy())
+    selected_master_df = selected_master_df.merge(
+        projects_df[["project_no", "dimensions", "label", "sheet"]], on=["project_no", "dimensions"], how="inner"
+    )
+    if selected_master_df.empty:
+        return _empty_state("No data available for the selected projects.")
+
+    # --- Repair Ratio Trend: one line per project (color) x per selected
+    # series (line style) — the same feature set as Pipe Analysis's Project
+    # Trend chart (render_project_trend), generalized to several projects
+    # at once: flat/untouched-day runs collapsed per line, an optional
+    # Compact Timeline (categorical axis + "+N days" gap annotations),
+    # always-on point labels, and a single-series trend-line fit. ---
+    SERIES_META = {
+        "Excl": {"col": "repair_ratio", "dash": "solid", "text_pos": "top center", "label": "Excl. Skelp"},
+        "Incl": {"col": "repair_ratio_incl_skelp", "dash": "dash", "text_pos": "bottom center", "label": "Incl. Skelp"},
+    }
+    selected_series = [s for s in (selected_series or []) if s in SERIES_META]
+    compact = "compact" in (compact_toggle or [])
+    window_start = selected_master_df["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
+    palette = px.colors.qualitative.Plotly
+
+    per_project_series: dict = {}
+    for i, p in enumerate(projects):
+        proj_df = selected_master_df[selected_master_df["sheet"] == p["sheet"]].sort_values("date")
+        proj_df = proj_df[proj_df["date"] >= window_start].copy()
+        if proj_df.empty:
+            continue
+        proj_df["repair_ratio"] = proj_df["repair_ratio"].round(4)
+        proj_df["repair_ratio_incl_skelp"] = proj_df["repair_ratio_incl_skelp"].round(4)
+        for series in selected_series:
+            value_col = SERIES_META[series]["col"]
+            per_project_series[(i, series)] = _collapse_unchanged_days(proj_df, value_col) if compact else proj_df
+
+    date_labels: dict = {}
+    if compact:
+        all_dates = sorted({d for df in per_project_series.values() for d in df["date"]})
+        date_labels = {d: d.strftime("%d.%m.%y") for d in all_dates}
+        date_index = {d: i for i, d in enumerate(all_dates)}
+
+    trend_fig = go.Figure()
+    trend_annotations = []
+    hover_x = "%{x}" if compact else "%{x|%d.%m.%Y}"
+    for (i, series), series_df in per_project_series.items():
+        p = projects[i]
+        meta = SERIES_META[series]
+        color = palette[i % len(palette)]
+        x = [date_labels[d] for d in series_df["date"]] if compact else series_df["date"]
+        trend_fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=series_df[meta["col"]] * 100,
+                mode="lines+markers+text",
+                name=f"{p['label']} — {meta['label']}",
+                line=dict(color=color, width=2.5, dash=meta["dash"]),
+                marker=dict(size=6, color=color),
+                text=(series_df[meta["col"]] * 100).map("{:.2f}%".format),
+                textposition=meta["text_pos"],
+                textfont=dict(size=9, color=color),
+                hovertemplate=f"{hover_x}<br>{p['label']} ({meta['label']}): <b>%{{y:.2f}}%</b><extra></extra>",
+            )
+        )
+        if compact:
+            trend_annotations += _gap_annotations(
+                series_df, meta["col"], date_index, color, yshift=22 if series == "Excl" else -22
+            )
+
+    # Trend-line fit: same rule as every other trend chart — only drawn
+    # when a single series is isolated, one dotted line per project so the
+    # slope comparison itself stays readable.
+    if len(selected_series) == 1:
+        series = selected_series[0]
+        value_col = SERIES_META[series]["col"]
+        for i, p in enumerate(projects):
+            proj_df = selected_master_df[selected_master_df["sheet"] == p["sheet"]].sort_values("date")
+            proj_df = proj_df[proj_df["date"] >= window_start]
+            trend_trace = _build_trend_trace(proj_df, value_col)
+            if trend_trace is None:
+                continue
+            color = palette[i % len(palette)]
+            trend_trace.line.color = color
+            trend_trace.line.width = 1.5
+            trend_trace.name = f"{p['label']} Trend"
+            if compact:
+                series_df = per_project_series.get((i, series))
+                start_date, end_date = proj_df["date"].min(), proj_df["date"].max()
+                if series_df is None or series_df.empty or start_date not in date_labels or end_date not in date_labels:
+                    continue
+                trend_trace.x = [date_labels[start_date], date_labels[end_date]]
+                trend_trace.y = [trend_trace.y[0], trend_trace.y[-1]]
+            trend_fig.add_trace(trend_trace)
+
+    trend_fig.update_layout(
+        title="Repair Ratio Trend (Selected Projects)",
+        xaxis_title="Date",
+        yaxis_title="Repair Ratio (%)",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=40),
+        hoverlabel=HOVER_STYLE,
+        annotations=trend_annotations,
+    )
+    if compact:
+        category_order = [date_labels[d] for d in sorted(date_labels)]
+        trend_fig.update_xaxes(type="category", categoryorder="array", categoryarray=category_order, tickangle=-45)
+    else:
+        trend_fig.update_xaxes(type="date", tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
+
+    # --- Latest-Day Repair Ratio: same stacked base+skelp-impact bar the
+    # dashboard uses for its "top 5" chart, filtered to the selected
+    # projects instead — "where does each stand today." ---
+    snapshot_df = (
+        selected_master_df.sort_values("date")
+        .groupby(["project_no", "dimensions"], as_index=False)
+        .tail(1)
+        .sort_values("repair_ratio", ascending=False)
+    )
+    snapshot_df["skelp_impact"] = (snapshot_df["repair_ratio_incl_skelp"] - snapshot_df["repair_ratio"]).round(6)
+    max_stack = (snapshot_df["repair_ratio"] + snapshot_df["skelp_impact"]).max() if len(snapshot_df) else 0
+    base_text = [
+        f"{r:.2%}<br>Qty {q:.0f}" if max_stack and r >= max_stack * 0.1 else ""
+        for r, q in zip(snapshot_df["repair_ratio"], snapshot_df["qty"])
+    ]
+    impact_text = [
+        f"+{imp:.2%}" if max_stack and imp >= max_stack * 0.08 else "" for imp in snapshot_df["skelp_impact"]
+    ]
+    ratio_fig = go.Figure()
+    ratio_fig.add_trace(
+        go.Bar(
+            x=snapshot_df["label"],
+            y=snapshot_df["repair_ratio"],
+            name="Repair Ratio",
+            marker_color=COLOR_COIL,
+            text=base_text,
+            textposition="inside",
+            textfont=dict(size=11, color="white"),
+            hovertemplate="%{x}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+        )
+    )
+    ratio_fig.add_trace(
+        go.Bar(
+            x=snapshot_df["label"],
+            y=snapshot_df["skelp_impact"],
+            name="Skelp Impact",
+            marker_color=COLOR_SECONDARY,
+            text=impact_text,
+            textposition="inside",
+            textfont=dict(size=11, color="white"),
+            hovertemplate="%{x}<br>Skelp Impact: <b>+%{y:.2%}</b><extra></extra>",
+        )
+    )
+    for label, r, imp, q, base_t, impact_t in zip(
+        snapshot_df["label"], snapshot_df["repair_ratio"], snapshot_df["skelp_impact"], snapshot_df["qty"],
+        base_text, impact_text,
+    ):
+        lines = []
+        if not impact_t:
+            lines.append(f"+{imp:.2%}")
+        if not base_t:
+            lines.append(f"{r:.2%} (Qty {q:.0f})")
+        if lines:
+            ratio_fig.add_annotation(
+                x=label, y=r + imp, text="<br>".join(lines), showarrow=False, yshift=14,
+                font=dict(size=9, color="#1e293b"),
+            )
+    ratio_fig.update_layout(
+        barmode="stack",
+        title="Latest-Day Repair Ratio (Selected Projects)",
+        yaxis_title="Repair Ratio",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=50, b=80),
+        hoverlabel=HOVER_STYLE,
+        xaxis=dict(categoryorder="array", categoryarray=snapshot_df["label"].tolist()),
+    )
+    ratio_fig.update_xaxes(tickangle=-25)
+    ratio_fig.update_yaxes(tickformat=".2%")
+
+    # --- Repair Ratio Distribution: one box per project, pipe-level spread
+    # comparison — _build_box_fig already groups by whatever x_col you give
+    # it, so handing it just the selected projects' pipe rows is a direct
+    # reuse, not a new chart. ---
+    box_section = None
+    box_df = pipe_df[pipe_df["project_sheet"].isin([p["sheet"] for p in projects])].copy()
+    if not box_df.empty:
+        label_by_sheet = dict(zip(projects_df["sheet"], projects_df["label"]))
+        box_df["project_label"] = box_df["project_sheet"].map(label_by_sheet)
+        box_df["repair_ratio_pct"] = (box_df["repair_ratio"] * 100).round(4)
+        box_fig = _build_box_fig(
+            box_df, "project_label", "Project", "Repair Ratio Distribution (Selected Projects)"
+        )
+        box_section = dcc.Graph(figure=box_fig)
+
+    # --- Summary table: exact numbers, since every chart above rounds for
+    # readability. ---
+    table_df = snapshot_df[
+        ["label", "dimensions", "qty", "repair_ratio", "repair_ratio_incl_skelp", "total_repair_amount", "project_status", "date"]
+    ].copy()
+    table_df["total_repair_amount"] = amount_in_display_unit(table_df["total_repair_amount"], selected_unit)
+    table_df["date"] = table_df["date"].dt.strftime("%d.%m.%Y")
+    table_columns = [
+        "label", "dimensions", "qty", "repair_ratio", "repair_ratio_incl_skelp", "total_repair_amount",
+        "project_status", "date",
+    ]
+    comparison_table = dash_table.DataTable(
+        data=_table_records(table_df, table_columns),
+        columns=_table_columns(
+            table_columns,
+            label_overrides={
+                "label": "Project",
+                "total_repair_amount": f"Repair Amount ({u})",
+                "date": "Latest Report",
+            },
+        ),
+        page_size=10,
+        sort_action="native",
+        style_table={"overflowX": "auto"},
+        style_cell=TABLE_CELL_STYLE,
+        style_header=TABLE_HEADER_STYLE,
+        style_data_conditional=TABLE_CONDITIONAL_STYLE,
+    )
+
+    children = [
+        html.H3(f"Comparing {len(projects)} Projects"),
+        dcc.Graph(figure=trend_fig),
+        dcc.Graph(figure=ratio_fig),
+    ]
+    if box_section is not None:
+        children.append(box_section)
+    children.append(html.H4("Summary"))
+    children.append(comparison_table)
+    return html.Div(children)
 
 
 # ---------------------------------------------------------------------------
