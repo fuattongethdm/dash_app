@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
-from typing import BinaryIO
 from datetime import date
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook
 from openpyxl.utils import column_index_from_string
 
 from validators import (
@@ -116,15 +114,12 @@ def _production_type(default_type: str, project_no: str) -> str:
     return default_type
 
 
-def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, ValidationReport]:
+def parse_daily_repair_rate(wb: Workbook) -> tuple[pd.DataFrame, ValidationReport]:
+    """``wb`` is an already-opened openpyxl Workbook (``load_workbook(file,
+    read_only=True, data_only=True)``) — the caller opens it once and shares
+    it with the other two parsers instead of each re-opening the same file
+    from scratch (see pages/home.py:handle_upload)."""
     report = ValidationReport()
-
-    try:
-        wb = load_workbook(file, read_only=True, data_only=True)
-    except Exception as exc:
-        report.add_check("Sheet found?", False)
-        report.add_error(f"Could not open Excel file: {exc}")
-        return pd.DataFrame(), report
 
     sheet_name = _select_sheet(wb)
     if sheet_name is None:
@@ -143,11 +138,26 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
 
     sections = NEW_FORMAT_SECTIONS if _is_new_format(ws) else OLD_FORMAT_SECTIONS
 
+    # Single sequential pass instead of per-cell bracket access — random
+    # cell access on a read_only worksheet re-scans from the start of the
+    # sheet on every call, which is what made the pipe-level parser take
+    # 73s before it was switched to this same pattern (see project_parser.py
+    # and parse_repair_rate_archive below, which already used it here).
+    col_index = {key: column_index_from_string(letter) for key, letter in COLUMN_MAP.items()}
+    min_row = min(section["start_row"] for section in sections)
+    max_row = max(section["end_row"] for section in sections)
+    grid: dict[tuple[int, int], object] = {}
+    rows_iter = ws.iter_rows(min_row=min_row, max_row=max_row, values_only=True)
+    for row_idx, row_values in enumerate(rows_iter, start=min_row):
+        for col_idx, value in enumerate(row_values, start=1):
+            if value is not None:
+                grid[(row_idx, col_idx)] = value
+
     rows: list[dict[str, object]] = []
     for section in sections:
         for excel_row in range(section["start_row"], section["end_row"] + 1):
-            project_no = _clean_project_no(normalize_spaces(ws[f"{COLUMN_MAP['project_no']}{excel_row}"].value))
-            dimensions = normalize_spaces(ws[f"{COLUMN_MAP['dimensions']}{excel_row}"].value)
+            project_no = _clean_project_no(normalize_spaces(grid.get((excel_row, col_index["project_no"]))))
+            dimensions = normalize_spaces(grid.get((excel_row, col_index["dimensions"])))
 
             if not project_no or not dimensions:
                 continue
@@ -157,7 +167,7 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
                 "production_type": _production_type(section["production_type"], project_no),
                 "project_no": project_no,
                 "dimensions": dimensions,
-                "project_status": normalize_status(ws[f"{COLUMN_MAP['project_status']}{excel_row}"].value),
+                "project_status": normalize_status(grid.get((excel_row, col_index["project_status"]))),
                 "excel_row": excel_row,
             }
 
@@ -171,7 +181,7 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
                 "repair_ratio",
                 "repair_ratio_incl_skelp",
             ]:
-                row[col_name] = coerce_number(ws[f"{COLUMN_MAP[col_name]}{excel_row}"].value)
+                row[col_name] = coerce_number(grid.get((excel_row, col_index[col_name])))
 
             rows.append(row)
 
@@ -198,19 +208,17 @@ def parse_daily_repair_rate(file: str | Path | BinaryIO) -> tuple[pd.DataFrame, 
     return df, validate_dataframe(df, report)
 
 
-def parse_repair_rate_archive(file: str | Path | BinaryIO) -> pd.DataFrame:
+def parse_repair_rate_archive(wb: Workbook) -> pd.DataFrame:
     """Parse the current-year "Overall Repair Rates" archive table beneath
     the daily table (completed projects removed from the active list).
+
+    ``wb`` is an already-opened Workbook, shared with the other parsers —
+    see parse_daily_repair_rate's docstring.
 
     Returns a frame shaped for database.upsert_historical_baselines, or an
     empty frame if the sheet/section isn't found — callers should treat
     this as best-effort supplementary data, not block the main import on it.
     """
-    try:
-        wb = load_workbook(file, read_only=True, data_only=True)
-    except Exception:
-        return pd.DataFrame()
-
     sheet_name = _select_sheet(wb)
     if sheet_name is None:
         return pd.DataFrame()

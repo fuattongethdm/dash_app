@@ -388,6 +388,20 @@ def upsert_project_group_config(
     return 1
 
 
+def _strip_project_sheet_link_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """The "Project Mapping" review tool this table is filled in from has at
+    least once saved a project_no with stray trailing whitespace
+    ("2025Q-10-108JT   ") — an exact-string comparison anywhere downstream
+    then silently fails to match, making the same project look like two
+    different ones. Strip once here so every caller gets clean values."""
+    if df.empty:
+        return df
+    for col in ("project_sheet", "project_no", "dimensions"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    return df
+
+
 def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     """Every project_sheet -> project_no/dimensions mapping confirmed via the
     "Project Mapping" review tool (feature/project-sheet-mapping-tool branch).
@@ -405,7 +419,7 @@ def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataF
                 _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, empty)
                 return empty
             raise
-        df = pd.DataFrame(rows) if rows else empty
+        df = _strip_project_sheet_link_columns(pd.DataFrame(rows) if rows else empty)
         _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, df)
         return df
 
@@ -415,6 +429,7 @@ def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataF
     df = pd.read_sql_query("SELECT * FROM project_sheet_links ORDER BY project_sheet", conn)
     if should_close:
         conn.close()
+    df = _strip_project_sheet_link_columns(df)
     _cache_set(PROJECT_SHEET_LINK_TABLE_NAME, df)
     return df
 

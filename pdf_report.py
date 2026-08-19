@@ -453,20 +453,21 @@ def _pareto_chart(latest_df: pd.DataFrame, value_col: str, y_label: str, title: 
 
 
 def _dimension_ratio_chart(master_df: pd.DataFrame, selected_date) -> Image:
-    """Weighted repair ratio per dimension, top 15 by total repair amount —
-    mirrors the dashboard's "Weighted Repair Ratio by Dimension" chart
-    (pages/home.py, render_dashboard). Computed from raw feet/meter columns
-    (a ratio needs no display-unit conversion)."""
+    """Weighted repair ratio per dimension, top 15 by that same weighted
+    ratio — mirrors the dashboard's "Weighted Repair Ratio by Dimension"
+    chart (pages/home.py, render_dimension_detail). Computed from raw feet/
+    meter columns (a ratio needs no display-unit conversion). Ranked by
+    weighted_ratio (not total_repair_amount) since that's the metric the
+    chart actually displays — capping by volume first could silently drop a
+    high-ratio, low-volume dimension the chart's own title implies would
+    be shown."""
     day_df = master_df[master_df["date"] == selected_date]
-    dim_df = (
-        day_df.groupby("dimensions", as_index=False)
-        .agg(total_repair_amount=("total_repair_amount", "sum"), repaired_spiral_length=("repaired_spiral_length", "sum"))
-        .sort_values("total_repair_amount", ascending=False)
-        .head(15)
+    dim_df = day_df.groupby("dimensions", as_index=False).agg(
+        total_repair_amount=("total_repair_amount", "sum"), repaired_spiral_length=("repaired_spiral_length", "sum")
     )
     denom = dim_df["repaired_spiral_length"] * METERS_PER_FOOT
     dim_df["weighted_ratio"] = (dim_df["total_repair_amount"] / denom.where(denom != 0)).fillna(0)
-    dim_df = dim_df.sort_values("weighted_ratio", ascending=False).reset_index(drop=True)
+    dim_df = dim_df.sort_values("weighted_ratio", ascending=False).head(15).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(14, 4.2))
     x = range(len(dim_df))
@@ -669,7 +670,12 @@ def build_pdf_report(
         Paragraph("Daily Repair Rate Report", title_style),
         Paragraph(
             f"Report Date: {pd.to_datetime(selected_date).strftime('%d.%m.%Y')}  |  "
-            f"Active Projects: {latest_df['project_no'].nunique()}  |  "
+            # Matches the dashboard's "Active Project Count" card exactly:
+            # each project_no + dimensions row is its own production run in
+            # this business's tracking, so this counts rows, not unique
+            # project_no values (a project spanning several dimensions is
+            # meant to count once per dimension, not once overall).
+            f"Active Project Count: {(latest_df['project_status'] == 'In Progress').sum()}  |  "
             f"Coil and Plate Repair Rate: {current_ratio * 100:.2f}%",
             subtitle_style,
         ),
@@ -767,7 +773,7 @@ def _pipe_sequence_chart(sheet_df: pd.DataFrame, sheet_label: str) -> Image:
     point_colors = [_CATEGORY_COLORS.get(c, _ACCENT) for c in sheet_df["repair_category"]]
     ax.plot(sheet_df["pipe_no"], sheet_df["repair_ratio"], color=_ACCENT, linewidth=1, zorder=1)
     ax.scatter(sheet_df["pipe_no"], sheet_df["repair_ratio"], c=point_colors, s=18, zorder=2)
-    rolling_window = 10
+    rolling_window = 8
     rolling_avg = sheet_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
     ax.plot(
         sheet_df["pipe_no"], rolling_avg, color=_ACCENT2, linewidth=2, linestyle="--",
@@ -812,12 +818,11 @@ def _pipe_box_chart(sheet_df: pd.DataFrame, sheet_label: str) -> Image:
 
 
 def _pipe_detail_table(sheet_df: pd.DataFrame, unit: str) -> Table:
-    columns = ["id", "block_cell", "pipe_no", "pipe_length_ft", "repair_amount", "repair_ratio", "repair_count"]
-    header = ["Id", "Cell Ref.", "Pipe No.", f"Pipe Length ({unit})", f"Repair Amount ({unit})", "Repair Ratio", "B.E Count"]
+    columns = ["block_cell", "pipe_no", "pipe_length_ft", "repair_amount", "repair_ratio", "repair_count"]
+    header = ["Cell Ref.", "Pipe No.", f"Pipe Length ({unit})", f"Repair Amount ({unit})", "Repair Ratio", "B.E Count"]
     ordered = sheet_df[columns].sort_values("pipe_no")
     formatted = pd.DataFrame(
         {
-            "id": ordered["id"].astype(int).astype(str),
             "block_cell": ordered["block_cell"].astype(str),
             "pipe_no": ordered["pipe_no"].astype(int).astype(str),
             "pipe_length_ft": ordered["pipe_length_ft"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-"),
@@ -828,7 +833,7 @@ def _pipe_detail_table(sheet_df: pd.DataFrame, unit: str) -> Table:
     )
     data = [header] + formatted.values.tolist()
 
-    col_fractions = [0.08, 0.16, 0.12, 0.18, 0.18, 0.14, 0.14]
+    col_fractions = [0.18, 0.14, 0.18, 0.18, 0.16, 0.16]
     col_widths = [_USABLE_WIDTH * f for f in col_fractions]
 
     table = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")

@@ -14,11 +14,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import BinaryIO
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from validators import coerce_number, normalize_spaces
@@ -177,12 +175,13 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
 
 
 def parse_project_pipe_repairs(
-    file: str | Path | BinaryIO, report_date: object
+    wb: Workbook, report_date: object
 ) -> tuple[pd.DataFrame, ProjectParseReport]:
+    """``wb`` is an already-opened openpyxl Workbook, shared with the other
+    two parsers instead of each re-opening the same file from scratch (see
+    pages/home.py:handle_upload)."""
     report = ProjectParseReport()
     report_date_iso = pd.to_datetime(report_date).date().isoformat()
-
-    wb = load_workbook(file, read_only=True, data_only=True)
 
     all_rows: list[dict] = []
     for sheet_name in wb.sheetnames:

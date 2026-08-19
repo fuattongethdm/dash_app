@@ -1,6 +1,6 @@
 """
 Dashboard page: daily Excel import, the main dashboard, pipe-level
-drill-down, and project grouping — organized as tabs
+drill-down, and multi-project comparison — organized as tabs
 so the page doesn't grow into one long endless scroll as more sections
 are added.
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import re
 import time
 
@@ -26,6 +27,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, clientside_callback, dash_table, dcc, html
 from dash.dash_table.Format import Format, Scheme
+from openpyxl import load_workbook
 
 from calculations import (
     METERS_PER_FOOT,
@@ -52,7 +54,7 @@ from parser import parse_daily_repair_rate, parse_repair_rate_archive
 from pdf_report import build_pdf_report, build_pipe_analysis_pdf_report
 from pipe_analysis import worst_pipes
 from project_parser import parse_project_pipe_repairs
-from validators import mark_duplicate_counts
+from validators import ValidationReport, mark_duplicate_counts
 
 dash.register_page(__name__, path="/", name="Dashboard")
 
@@ -141,6 +143,12 @@ BUBBLE_LABEL_TOP_N = 5
 # activity. The "Pipes Repaired per Day" chart hides anything before this
 # floor so that lump doesn't dwarf the real daily counts.
 PIPE_TREND_FLOOR_DATE = pd.Timestamp("2026-08-03")
+
+# Which projects the Comparison tab pre-selects on page load — edit this
+# list to change them. Values are project_sheet names (the same ones
+# pipe-sheet-dropdown uses), not project numbers; check
+# load_project_sheet_links()'s project_sheet column for exact names.
+COMPARISON_DEFAULT_SHEETS = ["02-123 Pri1", "01-116 (42)"]
 
 
 TEXT_COLUMNS = {
@@ -335,6 +343,7 @@ def layout():
                                         "Select a dimension to compare all projects sharing it (latest day).",
                                         className="help-text",
                                     ),
+                                    dcc.Loading(html.Div(id="dimension-overview-content")),
                                     html.Div(
                                         [
                                             html.Div(
@@ -623,9 +632,23 @@ def handle_upload(contents, filename):
     if contents is None:
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
+    # Load the workbook once and hand the same one to all three parsers
+    # below, instead of each re-decoding + re-opening the same file from
+    # scratch — measured 24s for one 4.4MB, 60+ sheet upload before this,
+    # most of it from opening the whole workbook three separate times.
     try:
         file_obj = _decode_upload(contents)
-        df, report = parse_daily_repair_rate(file_obj)
+        wb = load_workbook(file_obj, read_only=True, data_only=True)
+    except Exception:
+        # The raw exception (e.g. "File is not a zip file") means nothing
+        # to a non-technical user — just say what to check instead.
+        report = ValidationReport()
+        report.add_check("Sheet found?", False)
+        report.add_error("Could not open this file — make sure it's a valid Excel (.xlsx) file.")
+        return _validation_summary(report), None, None, {"display": "none"}, None, None, None
+
+    try:
+        df, report = parse_daily_repair_rate(wb)
     except Exception as exc:  # don't crash the app on an unexpected error
         error_box = html.Div(
             f"An unexpected error occurred while reading the file: {exc}",
@@ -661,8 +684,7 @@ def handle_upload(contents, filename):
     summary_lines = []
     pipe_data_json = None
     try:
-        pipe_file_obj = _decode_upload(contents)
-        pipe_df, pipe_report = parse_project_pipe_repairs(pipe_file_obj, df["date"].iloc[0])
+        pipe_df, pipe_report = parse_project_pipe_repairs(wb, df["date"].iloc[0])
         if not pipe_df.empty:
             summary_lines.append(
                 html.P(
@@ -684,8 +706,7 @@ def handle_upload(contents, filename):
 
     archive_data_json = None
     try:
-        archive_file_obj = _decode_upload(contents)
-        archive_df = parse_repair_rate_archive(archive_file_obj)
+        archive_df = parse_repair_rate_archive(wb)
         if not archive_df.empty:
             archive_data_json = archive_df.to_json(orient="split")
     except Exception:
@@ -1275,6 +1296,7 @@ def _render_dashboard_inner(selected_unit):
                 className="chart-row chart-row-stacked",
             ),
             dcc.Graph(figure=worst_fig),
+            html.P("The number inside each bar is the pipe quantity (Qty) for that project.", className="help-text"),
             html.Div(
                 [
                     dcc.Graph(figure=skelp_fig, className="chart-half"),
@@ -1342,6 +1364,7 @@ def render_dashboard(_n_clicks, _import_result, selected_unit, active_tab):
     try:
         content = _render_dashboard_inner(selected_unit)
     except Exception:
+        logging.exception("render_dashboard failed")
         content = _empty_state("Something went wrong loading the dashboard. Try refreshing.")
     return content, time.time()
 
@@ -1441,6 +1464,7 @@ def render_pipe_overview(_stage_1, selected_unit):
     try:
         content = _render_pipe_overview_inner(selected_unit)
     except Exception:
+        logging.exception("render_pipe_overview failed")
         content = _empty_state("Something went wrong loading pipe activity. Try refreshing.")
     return content, time.time()
 
@@ -1515,7 +1539,9 @@ def _build_bubble_fig(
     return fig
 
 
-def _build_box_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go.Figure:
+def _build_box_fig(
+    df: pd.DataFrame, x_col: str, x_label: str, title: str, category_order: list[str] | None = None
+) -> go.Figure:
     """Box plot of repair_ratio_pct grouped by x_col — shows the spread
     (median, quartiles, outliers) within each group instead of collapsing
     it to a single average, so a group that's "fine on average but wildly
@@ -1554,6 +1580,8 @@ def _build_box_fig(df: pd.DataFrame, x_col: str, x_label: str, title: str) -> go
         showlegend=False,
     )
     fig.update_xaxes(tickangle=-25)
+    if category_order is not None:
+        fig.update_xaxes(categoryorder="array", categoryarray=category_order)
     return fig
 
 
@@ -1679,8 +1707,10 @@ def _build_trend_trace(series_df: pd.DataFrame, value_col: str = "weighted_repai
 )
 def render_overall_trend_chart(selected_series, _stage_1):
     master_df = load_master_data()
-    if master_df.empty or not selected_series:
+    if master_df.empty:
         return _empty_state("No data available. Import an Excel file first.")
+    if not selected_series:
+        return _empty_state("Select at least one series to display.")
 
     baseline_df = load_historical_baselines()
     overall_ratio = daily_weighted_repair_ratios(master_df, baseline_df).copy()
@@ -1762,8 +1792,10 @@ def render_overall_trend_chart(selected_series, _stage_1):
 )
 def render_type_trend_chart(selected_types, _stage_1):
     master_df = load_master_data()
-    if master_df.empty or not selected_types:
+    if master_df.empty:
         return _empty_state("No data available. Import an Excel file first.")
+    if not selected_types:
+        return _empty_state("Select at least one production type to display.")
 
     baseline_df = load_historical_baselines()
     window_start = master_df["date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS)
@@ -1907,17 +1939,16 @@ def _gap_annotations(df: pd.DataFrame, value_col: str, date_index: dict, color: 
 def render_project_trend(selected_sheet, selected_series, compact_toggle, active_tab):
     if active_tab != "tab-pipe":
         return dash.no_update
-    if not selected_sheet or not selected_series:
+    if not selected_sheet:
         return _empty_state("No data available. Import an Excel file first.")
+    if not selected_series:
+        return _empty_state("Select at least one series to display.")
 
     links_df = load_project_sheet_links()
     match = links_df[(links_df["project_sheet"] == selected_sheet) & (links_df["status"] == "confirmed")]
     if match.empty:
         return _empty_state("No confirmed project mapping for this sheet yet.")
-    # .strip(): at least one confirmed mapping carries stray whitespace in
-    # its project_no ("2025Q-10-108JT   "), which would otherwise silently
-    # fail to match anything in master_df below.
-    project_no = str(match.iloc[0]["project_no"]).strip()
+    project_no = match.iloc[0]["project_no"]
     dimensions = match.iloc[0]["dimensions"]
 
     master_df = load_master_data()
@@ -2170,14 +2201,18 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         )
     )
     sequence_fig.update_layout(
-        title=f"Repair Ratio by Production Number — {sheet_label}",
+        title=f"Repair Ratio by Production Order — {sheet_label}",
         xaxis_title="Pipe No.",
         yaxis_title="Repair Ratio",
         template="plotly_white",
         margin=dict(l=40, r=20, t=50, b=40),
         hoverlabel=HOVER_STYLE,
     )
-    sequence_fig.update_yaxes(tickformat=".2%")
+    # rangemode="tozero": with very few pipes (a 1-pipe project in the
+    # extreme), Plotly's autorange has no real spread to work from and can
+    # center the only point in a huge, meaningless range (e.g. -50%..+100%
+    # for a single ~1% value) — anchoring at zero keeps the scale sane.
+    sequence_fig.update_yaxes(tickformat=".2%", rangemode="tozero")
 
     # Distribution of this one project's pipe ratios — median/quartiles/
     # outliers in a single box, complementing the production-order line
@@ -2202,7 +2237,7 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
     detail_columns = [
         c
         for c in sheet_df.columns
-        if c not in ("first_seen_date", "last_updated_date", "surface_state", "repair_category", "project_sheet")
+        if c not in ("id", "first_seen_date", "last_updated_date", "surface_state", "repair_category", "project_sheet")
     ]
     detail_table = dash_table.DataTable(
         data=_table_records(sheet_df, detail_columns),
@@ -2224,6 +2259,7 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
             html.H3(f"{sheet_label} — Pipe Details"),
             dcc.Graph(figure=worst_fig),
             dcc.Graph(figure=sequence_fig),
+            html.P("Point color marks the repair type: blue = Coating, orange = Clutch.", className="help-text"),
             box_section,
             detail_table,
         ]
@@ -2249,9 +2285,11 @@ def load_comparison_options(_id, _import_result):
     sheets = set(pipe_df["project_sheet"].unique())
     mapped_sheets = sorted(sheets & label_map.keys(), key=lambda s: label_map[s])
     options = [{"label": label_map[s], "value": s} for s in mapped_sheets]
-    # Pre-select the first two so the tab shows a working comparison right
-    # away instead of an empty "pick something" state.
-    return options, [o["value"] for o in options[:2]]
+    # Pre-select these so the Comparison tab shows a working example right
+    # away instead of an empty "pick something" state — edit the sheet
+    # names in COMPARISON_DEFAULT_SHEETS above to change which ones.
+    default = [s for s in COMPARISON_DEFAULT_SHEETS if s in mapped_sheets] or [o["value"] for o in options[:2]]
+    return options, default
 
 
 # ---------------------------------------------------------------------------
@@ -2287,10 +2325,7 @@ def render_comparison(selected_sheets, selected_series, compact_toggle, selected
         match = confirmed[confirmed["project_sheet"] == sheet]
         if match.empty:
             continue
-        # .strip(): at least one confirmed mapping carries stray whitespace
-        # in its project_no ("2025Q-10-108JT   "), which would otherwise
-        # silently fail to match anything in master_df below.
-        project_no = str(match.iloc[0]["project_no"]).strip()
+        project_no = match.iloc[0]["project_no"]
         dimensions = match.iloc[0]["dimensions"]
         stripped_project_no = re.sub(r"^\d{4}Q-", "", project_no)
         label = f"{stripped_project_no} ({dimensions})"
@@ -2489,7 +2524,11 @@ def render_comparison(selected_sheets, selected_series, compact_toggle, selected
         box_df["project_label"] = box_df["project_sheet"].map(label_by_sheet)
         box_df["repair_ratio_pct"] = (box_df["repair_ratio"] * 100).round(4)
         box_fig = _build_box_fig(
-            box_df, "project_label", "Project", "Repair Ratio Distribution (Selected Projects)"
+            box_df,
+            "project_label",
+            "Project",
+            "Repair Ratio Distribution (Selected Projects)",
+            category_order=snapshot_df["label"].tolist(),
         )
         box_section = dcc.Graph(figure=box_fig)
 
@@ -2522,9 +2561,14 @@ def render_comparison(selected_sheets, selected_series, compact_toggle, selected
         style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
+    trend_section = (
+        dcc.Graph(figure=trend_fig)
+        if selected_series
+        else _empty_state("Select at least one series to display the trend chart.")
+    )
     children = [
         html.H3(f"Comparing {len(projects)} Projects"),
-        dcc.Graph(figure=trend_fig),
+        trend_section,
         dcc.Graph(figure=ratio_fig),
     ]
     if box_section is not None:
@@ -2560,27 +2604,27 @@ def load_dimension_options(_id, _import_result):
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("dimension-detail-content", "children"),
-    Input("dimension-detail-dropdown", "value"),
+    Output("dimension-overview-content", "children"),
     Input("dashboard-stage-2", "data"),  # chained after pipe-overview-content, not parallel to it
     State("unit-toggle", "value"),
     prevent_initial_call=True,
 )
-def render_dimension_detail(selected_dimension, _stage_2, selected_unit):
-    if not selected_dimension:
-        return _empty_state("No data available. Import an Excel file first.")
-
+def render_dimension_overview(_stage_2, selected_unit):
+    """The two "all dimensions" charts — independent of which single
+    dimension is selected below, so this is its own callback rather than
+    part of render_dimension_detail: that function used to rebuild these
+    two on every dropdown change even though neither one depends on the
+    dropdown's value."""
     master_df = load_master_data()
+    if master_df.empty:
+        return _empty_state("No data available. Import an Excel file first.")
     latest_date, latest_df = _latest_day_frame(master_df)
     u = unit_label(selected_unit)
 
-    # --- All-dimensions overview (moved here from the main Dashboard card
-    # and the bubble-view-toggle, so every dimension-grouped chart lives
-    # together in one place instead of being split across two tabs). Ranked
-    # by weighted_ratio (not total_repair_amount) since that's the metric
-    # the chart actually displays — capping by volume first could silently
-    # drop a high-ratio, low-volume dimension the chart's own title implies
-    # would be shown.
+    # Ranked by weighted_ratio (not total_repair_amount) since that's the
+    # metric the chart actually displays — capping by volume first could
+    # silently drop a high-ratio, low-volume dimension the chart's own
+    # title implies would be shown.
     overview_dim_df = latest_df.groupby("dimensions", as_index=False).agg(
         total_repair_amount=("total_repair_amount", "sum"),
         repaired_spiral_length=("repaired_spiral_length", "sum"),
@@ -2631,6 +2675,24 @@ def render_dimension_detail(selected_dimension, _stage_2, selected_unit):
         unit=u,
         label_col="dimensions",
     )
+
+    return html.Div([dcc.Graph(figure=dimension_ratio_fig), dcc.Graph(figure=dimension_bubble_fig)])
+
+
+# ---------------------------------------------------------------------------
+# Callback 12b: Dimension Detail — the per-selected-dimension drill-down
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("dimension-detail-content", "children"),
+    Input("dimension-detail-dropdown", "value"),
+)
+def render_dimension_detail(selected_dimension):
+    if not selected_dimension:
+        return _empty_state("No data available. Import an Excel file first.")
+
+    master_df = load_master_data()
+    _latest_date, latest_df = _latest_day_frame(master_df)
 
     dim_df = latest_df[latest_df["dimensions"] == selected_dimension].sort_values(
         "repair_ratio", ascending=False
@@ -2716,8 +2778,6 @@ def render_dimension_detail(selected_dimension, _stage_2, selected_unit):
     )
 
     children = [
-        dcc.Graph(figure=dimension_ratio_fig),
-        dcc.Graph(figure=dimension_bubble_fig),
         html.H3(f"Dimension {selected_dimension} — Detail"),
         dcc.Graph(figure=trend_fig),
         dcc.Graph(figure=fig),
