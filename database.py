@@ -66,11 +66,13 @@ CREATE TABLE IF NOT EXISTS pipe_repair_details (
     block_cell TEXT NOT NULL,
     pipe_no INTEGER NOT NULL,
     pipe_length_ft REAL,
-    repair_amount REAL NOT NULL,
-    repair_ratio REAL NOT NULL,
+    repair_amount REAL,
+    repair_ratio REAL,
     repair_count INTEGER,
     repair_category TEXT NOT NULL,
-    surface_state TEXT NOT NULL,
+    surface_state TEXT,
+    status TEXT NOT NULL DEFAULT 'Repaired',
+    repaired_date TEXT,
     UNIQUE(project_sheet, block_cell)
 );
 """
@@ -146,11 +148,11 @@ PIPE_UPSERT_SQL = """
 INSERT INTO pipe_repair_details (
     first_seen_date, last_updated_date, project_sheet, block_cell, pipe_no,
     pipe_length_ft, repair_amount, repair_ratio, repair_count, repair_category,
-    surface_state
+    surface_state, status, repaired_date
 ) VALUES (
     :first_seen_date, :last_updated_date, :project_sheet, :block_cell, :pipe_no,
     :pipe_length_ft, :repair_amount, :repair_ratio, :repair_count, :repair_category,
-    :surface_state
+    :surface_state, :status, :repaired_date
 )
 ON CONFLICT(project_sheet, block_cell) DO UPDATE SET
     last_updated_date = excluded.last_updated_date,
@@ -160,7 +162,26 @@ ON CONFLICT(project_sheet, block_cell) DO UPDATE SET
     repair_ratio = excluded.repair_ratio,
     repair_count = excluded.repair_count,
     repair_category = excluded.repair_category,
-    surface_state = excluded.surface_state;
+    surface_state = excluded.surface_state,
+    -- If a pipe was Repaired before AND this upload's own parse still
+    -- shows repair data too, keep repaired_date frozen at when that first
+    -- happened (same "set once" behavior first_seen_date already has, not
+    -- in this SET list at all so SQLite leaves it untouched natively) --
+    -- don't reset it just because the upload re-confirms the same repair.
+    -- Otherwise (including a pipe that WAS Repaired but this upload's own
+    -- block now shows no repair data) trust this upload's own status/
+    -- repaired_date as parsed -- a correction in the source Excel is real,
+    -- current data and must not be permanently overridden by an earlier
+    -- upload's now-stale "Repaired" state.
+    status = CASE
+        WHEN pipe_repair_details.status = 'Repaired' AND excluded.status = 'Repaired' THEN 'Repaired'
+        ELSE excluded.status
+    END,
+    repaired_date = CASE
+        WHEN pipe_repair_details.status = 'Repaired' AND excluded.status = 'Repaired'
+            THEN pipe_repair_details.repaired_date
+        ELSE excluded.repaired_date
+    END;
 """
 
 PROJECT_GROUP_CONFIG_UPSERT_SQL = """
@@ -299,6 +320,18 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(repair_rates)").fetchall()}
     if "production_type" not in columns:
         conn.execute("ALTER TABLE repair_rates ADD COLUMN production_type TEXT NOT NULL DEFAULT 'Coil'")
+    # A pre-existing local pipe_repair_details (from before the "track
+    # produced-but-unrepaired pipes" feature) needs these two new columns —
+    # SQLite can't drop the old NOT NULL on repair_amount/repair_ratio/
+    # surface_state via ALTER TABLE, so a local DB created before this
+    # change stays unable to store a Produced-only pipe; a fresh one (this
+    # CREATE TABLE, run above) or Supabase (supabase_setup.sql) don't have
+    # that limitation.
+    pipe_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pipe_repair_details)").fetchall()}
+    if "status" not in pipe_columns:
+        conn.execute("ALTER TABLE pipe_repair_details ADD COLUMN status TEXT NOT NULL DEFAULT 'Repaired'")
+    if "repaired_date" not in pipe_columns:
+        conn.execute("ALTER TABLE pipe_repair_details ADD COLUMN repaired_date TEXT")
     conn.commit()
     if should_close:
         conn.close()
@@ -402,10 +435,55 @@ def _strip_project_sheet_link_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+PROJECT_SHEET_LINK_UPSERT_SQL = """
+INSERT INTO project_sheet_links (
+    project_sheet, project_no, dimensions, status, match_score
+) VALUES (
+    :project_sheet, :project_no, :dimensions, :status, :match_score
+)
+ON CONFLICT(project_sheet) DO UPDATE SET
+    project_no = excluded.project_no,
+    dimensions = excluded.dimensions,
+    status = excluded.status,
+    match_score = excluded.match_score,
+    updated_at = CURRENT_TIMESTAMP;
+"""
+
+
+def upsert_project_sheet_links(records: list[dict[str, Any]], conn: sqlite3.Connection | None = None) -> int:
+    """Manually confirm a project_sheet -> project_no/dimensions mapping —
+    e.g. a sheet the "Project Mapping" review tool (feature/project-sheet-
+    mapping-tool branch, not merged here) hasn't matched automatically yet.
+    Each record needs project_sheet/project_no/dimensions/status (usually
+    "confirmed") and match_score (None for a manually-verified mapping,
+    since no automated score was computed)."""
+    if not records:
+        return 0
+
+    if get_backend_name() == "supabase":
+        client = _get_supabase_client()
+        _execute_with_retry(
+            client.table(PROJECT_SHEET_LINK_TABLE_NAME).upsert(records, on_conflict="project_sheet")
+        )
+        _cache_invalidate(PROJECT_SHEET_LINK_TABLE_NAME)
+        return len(records)
+
+    should_close = conn is None
+    conn = conn or get_connection()
+    init_db(conn)
+    conn.executemany(PROJECT_SHEET_LINK_UPSERT_SQL, records)
+    conn.commit()
+    if should_close:
+        conn.close()
+    _cache_invalidate(PROJECT_SHEET_LINK_TABLE_NAME)
+    return len(records)
+
+
 def load_project_sheet_links(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     """Every project_sheet -> project_no/dimensions mapping confirmed via the
-    "Project Mapping" review tool (feature/project-sheet-mapping-tool branch).
-    Read-only here — mappings are written from that branch, not this one."""
+    "Project Mapping" review tool (feature/project-sheet-mapping-tool branch),
+    or manually via upsert_project_sheet_links for a one-off sheet it hasn't
+    reached yet."""
     cached = _cache_get(PROJECT_SHEET_LINK_TABLE_NAME)
     if cached is not None:
         return cached
@@ -522,11 +600,21 @@ def _pipe_records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
     ``first_seen_date`` and ``last_updated_date`` default to that date here;
     for a pipe that already exists, the caller (upsert_pipe_repair_details)
     overrides ``first_seen_date`` with its real, original value before
-    writing, so a pipe's repair date never changes on re-upload."""
+    writing, so a pipe's repair date never changes on re-upload.
+
+    ``status`` (``"Produced"``/``"Repaired"``) already comes from the
+    parser, computed purely from whether *this* block has repair data —
+    ``repaired_date`` is provisionally set to today's upload date whenever
+    status is ``"Repaired"`` here, but that's only correct for a pipe
+    that's *never* had repair data before; the caller corrects it (and
+    ``status`` itself) against whatever's already on file, so a pipe
+    repaired days ago doesn't get its repaired_date reset to today just
+    because this upload still shows it as repaired."""
     write_df = df.drop(columns=["id"], errors="ignore").copy()
     upload_date = pd.to_datetime(write_df["date"]).dt.strftime("%Y-%m-%d")
     write_df["first_seen_date"] = upload_date
     write_df["last_updated_date"] = upload_date
+    write_df["repaired_date"] = upload_date.where(write_df["status"] == "Repaired")
     write_df = write_df.drop(columns=["date"])
     records = write_df.astype(object).where(pd.notna(write_df), None).to_dict(orient="records")
     for record in records:
@@ -606,15 +694,16 @@ def load_master_data(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     return df
 
 
-def _existing_pipe_first_seen() -> dict[tuple[str, str], str]:
-    """(project_sheet, block_cell) -> first_seen_date for every pipe already
-    on file — the whole table, no date filter, since the table is now
-    bounded to one row per physical pipe rather than one per pipe per day.
-    Supabase-only: PostgREST's upsert can't "update every column except
-    one," so the caller uses this to preserve a pipe's original
-    first_seen_date in Python before re-upserting it. SQLite's
-    ON CONFLICT ... DO UPDATE already leaves first_seen_date untouched
-    natively, so it doesn't need this lookup."""
+def _existing_pipe_state() -> dict[tuple[str, str], dict[str, Any]]:
+    """(project_sheet, block_cell) -> {first_seen_date, status, repaired_date}
+    for every pipe already on file — the whole table, no date filter, since
+    the table is now bounded to one row per physical pipe rather than one
+    per pipe per day. Supabase-only: PostgREST's upsert can't "update every
+    column except some," so the caller uses this to preserve a pipe's
+    original first_seen_date, and its status/repaired_date once it's been
+    marked Repaired, in Python before re-upserting it. SQLite's
+    ON CONFLICT ... DO UPDATE already handles all three natively (see
+    PIPE_UPSERT_SQL), so it doesn't need this lookup."""
     client = _get_supabase_client()
     rows: list[dict[str, Any]] = []
     page_size = 1000
@@ -622,7 +711,7 @@ def _existing_pipe_first_seen() -> dict[tuple[str, str], str]:
         for start in range(0, 100_000, page_size):
             response = _execute_with_retry(
                 client.table(PIPE_TABLE_NAME)
-                .select("project_sheet,block_cell,first_seen_date")
+                .select("project_sheet,block_cell,first_seen_date,status,repaired_date")
                 .order("project_sheet")
                 .order("block_cell")
                 .range(start, start + page_size - 1)
@@ -634,7 +723,7 @@ def _existing_pipe_first_seen() -> dict[tuple[str, str], str]:
         if PIPE_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
             return {}
         raise
-    return {(row["project_sheet"], row["block_cell"]): row["first_seen_date"] for row in rows}
+    return {(row["project_sheet"], row["block_cell"]): row for row in rows}
 
 
 def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None = None) -> int:
@@ -644,11 +733,26 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
 
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        existing_first_seen = _existing_pipe_first_seen()
+        existing_state = _existing_pipe_state()
         for record in records:
             key = (record["project_sheet"], record["block_cell"])
-            if key in existing_first_seen:
-                record["first_seen_date"] = existing_first_seen[key]
+            existing = existing_state.get(key)
+            if existing is None:
+                continue  # brand new pipe — keep this upload's own status/repaired_date/first_seen_date as-is
+            record["first_seen_date"] = existing["first_seen_date"]
+            if existing.get("status") == "Repaired" and record["status"] == "Repaired":
+                # Already repaired as of some earlier upload, and this
+                # upload's own parse still shows repair data too — don't
+                # reset repaired_date to today just because this upload
+                # re-confirms the same repair.
+                record["repaired_date"] = existing.get("repaired_date")
+            # else: let this upload's own computed status/repaired_date
+            # stand as parsed. Covers a pipe transitioning Produced ->
+            # Repaired today, AND a pipe that was marked Repaired before
+            # but this upload's own block now shows no repair data — a
+            # correction in the source Excel is real, current data and
+            # must not be permanently overridden by an earlier upload's
+            # now-stale "Repaired" state.
         for start in range(0, len(records), 500):
             batch = records[start : start + 500]
             _execute_with_retry(
@@ -763,6 +867,24 @@ def _normalize_pipe_repair_details(df: pd.DataFrame) -> pd.DataFrame:
     if not df.empty:
         df["first_seen_date"] = pd.to_datetime(df["first_seen_date"])
         df["last_updated_date"] = pd.to_datetime(df["last_updated_date"])
+        if "repaired_date" in df.columns:
+            df["repaired_date"] = pd.to_datetime(df["repaired_date"])
+        else:
+            # Supabase table not migrated yet (see supabase_setup.sql's
+            # commented-out migration block) — same reasoning as the
+            # "status" fallback below, so downstream code can always rely
+            # on this column existing.
+            df["repaired_date"] = pd.NaT
+        if "status" not in df.columns:
+            # A local SQLite DB created before this column existed and never
+            # migrated (init_db backfills new columns, but only for a DB it
+            # actually opens) — treat every row as Repaired, same as the
+            # column's own DEFAULT, rather than leaving downstream code to
+            # handle a missing column.
+            df["status"] = "Repaired"
+        # NaN repair_amount (a Produced, not-yet-repaired pipe) already
+        # compares False here, not True — this only zeroes genuine
+        # near-zero placeholder values on already-repaired pipes.
         placeholder_mask = pd.to_numeric(df["repair_amount"], errors="coerce").le(0.0001)
         df.loc[placeholder_mask, ["repair_amount", "repair_ratio"]] = 0.0
         sort_columns = [

@@ -201,6 +201,12 @@ body {
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
+  /* Without this, flex's default align-items:stretch forces every child to
+     match the row's tallest/shortest sibling — a Graph next to a short
+     DataTable (few rows) gets squeezed into that short height, collapsing
+     its own labels into an unreadable jumble. Each child keeps its own
+     natural height instead. */
+  align-items: flex-start;
 }
 
 .chart-half {
@@ -210,6 +216,11 @@ body {
 
 .chart-row-stacked {
   flex-direction: column;
+  /* In a column layout, align-items controls width, not height — restore
+     the default "stretch to full width" that .chart-row's flex-start
+     override (above) would otherwise also apply here, which shrank each
+     chart down to its own content width instead of filling the row. */
+  align-items: stretch;
 }
 
 .unit-toggle-row {

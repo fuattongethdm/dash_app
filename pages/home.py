@@ -26,7 +26,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, clientside_callback, dash_table, dcc, html
-from dash.dash_table.Format import Format, Scheme
+from dash.dash_table.Format import Format, Scheme, Sign
 from openpyxl import load_workbook
 
 from calculations import (
@@ -88,7 +88,16 @@ COLUMN_LABELS = {
     "repair_count": "B.E Count",
     "repair_category": "Category",
     "surface_state": "Surface State",
+    "status": "Status",
+    "repaired_date": "Repaired Date",
 }
+
+# Display-only relabeling for the pipe status value: the underlying `status`
+# column keeps storing "Produced" (matches project_parser.py/database.py's
+# upsert logic — renaming the stored value would need a live migration for
+# no real benefit). "Produced" alone read as "already finished" to users;
+# this is what's actually shown in the pie chart / detail table instead.
+STATUS_DISPLAY_LABELS = {"Produced": "Awaiting Repair"}
 
 # Ratio columns are displayed as percentages instead of raw decimals. The
 # underlying value is kept numeric (via dash_table's own Format, not a
@@ -122,10 +131,7 @@ COLOR_COIL = "#2563eb"
 COLOR_PLATE = "#7c3aed"
 COLOR_SECONDARY = "#f97316"
 COLOR_MUTED = "#94a3b8"
-
-# Pipe-level repair_category values (project_parser.py's "Coating" vs
-# "Clutch" block sides) — used to color-code the production-order chart.
-_CATEGORY_COLORS = {"Coating": COLOR_COIL, "Clutch": COLOR_SECONDARY}
+COLOR_DANGER = "#dc2626"
 
 # How many of the most recent days the trend charts (Overall/Type/Project/
 # Dimension Detail) show, and the window the fitted trend line is drawn
@@ -136,19 +142,28 @@ TREND_WINDOW_DAYS = 20
 # name shown on the chart instead of just the ratio value.
 BUBBLE_LABEL_TOP_N = 5
 
-# The initial bulk import (and pipes recovered later by parser fixes, which
-# are backdated to blend into that same original batch instead of showing
-# up as a fake spike on whatever day they were recovered) landed on
-# 2026-07-24 — a lump of pre-existing history, not real day-to-day repair
-# activity. The "Pipes Repaired per Day" chart hides anything before this
-# floor so that lump doesn't dwarf the real daily counts.
-PIPE_TREND_FLOOR_DATE = pd.Timestamp("2026-08-03")
+# Window for "Daily Repair Amount" and "Backlog Trend" specifically —
+# separate from TREND_WINDOW_DAYS (used by the ratio trend charts) since
+# these two are meant to show a fixed, shorter, always-14-day span rather
+# than "however much history exists."
+DAILY_CHARTS_WINDOW_DAYS = 14
+
+# Two one-time bulk-load lumps, not real day-to-day activity, that would
+# otherwise dwarf real daily counts on the "Daily Production vs. Repair,
+# and Backlog Trend" chart: the initial bulk import (and pipes recovered
+# later by parser fixes, backdated to blend into that same original batch)
+# landed on 2026-07-24; separately, activating produced-pipe tracking
+# itself backfilled ~376 already-existing-but-never-before-tracked
+# "Produced" pipes in a single day (2026-08-18), showing up as a fake
+# same-day spike to hundreds of "Produced" + a backlog cliff, not a real
+# jump in shop activity. The chart hides anything before this floor.
+PIPE_TREND_FLOOR_DATE = pd.Timestamp("2026-08-19")
 
 # Which projects the Comparison tab pre-selects on page load — edit this
 # list to change them. Values are project_sheet names (the same ones
 # pipe-sheet-dropdown uses), not project numbers; check
 # load_project_sheet_links()'s project_sheet column for exact names.
-COMPARISON_DEFAULT_SHEETS = ["02-123 Pri1", "01-116 (42)"]
+COMPARISON_DEFAULT_SHEETS = ["01-116 (42)", "06-131"]
 
 
 TEXT_COLUMNS = {
@@ -163,6 +178,8 @@ TEXT_COLUMNS = {
     "block_cell",
     "repair_category",
     "surface_state",
+    "status",
+    "repaired_date",
 }
 # Whole-number counts: no decimal formatting.
 INTEGER_COLUMNS = {"id", "qty", "pipe_no", "repair_count", "pipe_count", "project_count"}
@@ -187,13 +204,18 @@ def _table_columns(columns, label_overrides: dict[str, str] | None = None) -> li
 def _table_records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
     """Round numeric columns for display. Percent columns keep their raw
     0-1 fraction — the column's Format (see _table_columns) renders that as
-    a percentage, so filtering/sorting stays numeric rather than string."""
+    a percentage, so filtering/sorting stays numeric rather than string.
+    NaN is converted to None (e.g. a Produced pipe's still-null
+    repair_amount/repair_ratio) so DataTable renders a blank cell — a raw
+    float NaN survives to JSON as the bare token NaN, which the frontend's
+    numeric Format renders as the literal text "NaN" instead of blank."""
     out = df[columns].copy()
     for col in columns:
         if col in PERCENT_COLUMNS:
             continue
         if pd.api.types.is_numeric_dtype(out[col]):
             out[col] = out[col].round(4)
+    out = out.astype(object).where(pd.notna(out), None)
     return out.to_dict("records")
 
 
@@ -331,19 +353,18 @@ def layout():
                             ),
                             html.Section(
                                 [
-                                    html.H2("Pipe Activity Overview"),       
-                                    dcc.Loading(html.Div(id="pipe-overview-content")),
-                                ],
-                                className="card",
-                            ),
-                            html.Section(
-                                [
                                     html.H2("Dimension Detail"),
+                                    html.H3("All Dimensions — Overview"),
+                                    html.P(
+                                        "Every dimension at once (latest day) — not affected by the picker below.",
+                                        className="help-text",
+                                    ),
+                                    dcc.Loading(html.Div(id="dimension-overview-content")),
+                                    html.H3("Drill Down by Dimension"),
                                     html.P(
                                         "Select a dimension to compare all projects sharing it (latest day).",
                                         className="help-text",
                                     ),
-                                    dcc.Loading(html.Div(id="dimension-overview-content")),
                                     html.Div(
                                         [
                                             html.Div(
@@ -357,6 +378,26 @@ def layout():
                                         className="filter-row",
                                     ),
                                     dcc.Loading(html.Div(id="dimension-detail-content")),
+                                    # This table depends on the dropdown
+                                    # above (changes per selected dimension),
+                                    # so it stays attached to this section
+                                    # instead of moving to the static Tables
+                                    # section below — still below its own
+                                    # charts, just not detached from the
+                                    # control that drives it.
+                                    dcc.Loading(html.Div(id="dimension-detail-table-content")),
+                                ],
+                                className="card",
+                            ),
+                            # Tables that don't depend on a picker inside
+                            # their own section, grouped here at the very
+                            # bottom of the page instead of breaking up the
+                            # charts above.
+                            html.Section(
+                                [
+                                    html.H2("Tables"),
+                                    dcc.Loading(html.Div(id="dashboard-table-content")),
+                                    dcc.Loading(html.Div(id="pipe-overview-content")),
                                 ],
                                 className="card",
                             ),
@@ -835,10 +876,14 @@ def download_pipe_analysis_pdf(n_clicks, selected_sheet, selected_unit):
 # ---------------------------------------------------------------------------
 
 def _render_dashboard_inner(selected_unit):
+    """Returns (main_content, table_content) — split so the callback can
+    place the "Latest Day" table in the dedicated Tables section at the
+    bottom of the page instead of in the middle of the charts."""
     master_df = load_master_data()
 
     if master_df.empty:
-        return _empty_state("No data in the database yet. Upload and import an Excel file first.")
+        empty = _empty_state("No data in the database yet. Upload and import an Excel file first.")
+        return empty, None
 
     baseline_df = load_historical_baselines()
     u = unit_label(selected_unit)
@@ -867,6 +912,10 @@ def _render_dashboard_inner(selected_unit):
 
     # --- Daily repair amount (bar) ---
     daily_amount = repair_amount_trend_data(master_df, display_unit=selected_unit)
+    if not daily_amount.empty:
+        daily_amount = daily_amount[
+            daily_amount["date"] >= daily_amount["date"].max() - pd.Timedelta(days=DAILY_CHARTS_WINDOW_DAYS - 1)
+        ]
     bar_fig = px.bar(
         daily_amount,
         x="date",
@@ -884,45 +933,201 @@ def _render_dashboard_inner(selected_unit):
     bar_fig.update_layout(template="plotly_white", margin=dict(l=40, r=20, t=50, b=40), hoverlabel=HOVER_STYLE)
     bar_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
 
-    # --- Pipes repaired per day (all mapped projects) — grouped side by
-    # side with the amount chart above since they're often looked at
-    # together, even though they measure different things (repair volume
-    # in ft/m vs. pipe count). first_seen_date is the day a pipe was first
-    # repaired (see upsert_pipe_repair_details); PIPE_TREND_FLOOR_DATE hides
-    # the initial bulk-import lump so it doesn't dwarf real daily activity.
+    # --- Daily Produced vs. Repaired (clustered bars) + a secondary-axis
+    # line for the running "cut but not yet repaired" backlog across all
+    # mapped projects — makes it visible at a glance whether the shop is
+    # catching up or falling further behind, not just how much happened on
+    # any one day. Produced/Repaired bars use the same TREND_WINDOW_DAYS/
+    # PIPE_TREND_FLOOR_DATE window as the rest of this dashboard's daily
+    # charts; the backlog line needs each pipe's *entire* history (a pipe
+    # cut long before the window and still unrepaired still counts toward
+    # every window day's backlog), not just the window.
     daily_pipe_fig = None
+    daily_pipe_table = None
     pipe_df_for_daily = load_pipe_repair_details()
     if not pipe_df_for_daily.empty:
         pipe_label_map = _pipe_sheet_label_map(load_project_sheet_links())
         mapped_pipe_df = pipe_df_for_daily[pipe_df_for_daily["project_sheet"].isin(pipe_label_map)]
         if not mapped_pipe_df.empty:
+            repaired_pipe_df = mapped_pipe_df[mapped_pipe_df["status"] == "Repaired"]
+            latest_activity = mapped_pipe_df[["first_seen_date", "repaired_date"]].max().max()
             daily_pipe_window_start = max(
-                mapped_pipe_df["first_seen_date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS),
+                latest_activity - pd.Timedelta(days=DAILY_CHARTS_WINDOW_DAYS - 1),
                 PIPE_TREND_FLOOR_DATE,
             )
-            daily_pipe_counts = (
-                mapped_pipe_df[mapped_pipe_df["first_seen_date"] >= daily_pipe_window_start]
-                .groupby(mapped_pipe_df["first_seen_date"].dt.date)
-                .size()
-                .reset_index(name="count")
-                .rename(columns={"first_seen_date": "date"})
-            )
-            daily_pipe_fig = px.bar(daily_pipe_counts, x="date", y="count")
-            daily_pipe_fig.update_traces(
-                marker_color=COLOR_SECONDARY,
-                texttemplate="%{y}",
-                textposition="outside",
-                hovertemplate="%{x|%d.%m.%Y}<br>Pipes Repaired: <b>%{y}</b><extra></extra>",
-            )
-            daily_pipe_fig.update_layout(
-                title="Pipes Repaired per Day (All Projects)",
-                xaxis_title="Date",
-                yaxis_title="Pipes Repaired",
-                template="plotly_white",
-                margin=dict(l=40, r=20, t=50, b=40),
-                hoverlabel=HOVER_STYLE,
-            )
-            daily_pipe_fig.update_xaxes(tickformat="%d.%m.%y", dtick="D1", tickangle=-45)
+            # Nothing on/after PIPE_TREND_FLOOR_DATE yet (e.g. the floor was
+            # just moved past the most recent upload to hide a one-time
+            # bulk-load lump) -- skip the chart entirely rather than render
+            # empty axes; it reappears on its own once a new upload lands
+            # past the floor.
+            if daily_pipe_window_start <= latest_activity:
+                # A categorical axis divides the plot width evenly across
+                # however many categories exist — with very few real days
+                # (e.g. just today, right after the floor date moves
+                # forward), 1-2 categories would each claim a huge share of
+                # the width and render as grotesquely fat bars. Padding the
+                # display out to a minimum number of days (with blank
+                # future dates, zero bars, stock flat-lined at its last
+                # known value) keeps bar proportions sane regardless of how
+                # little real data exists yet; the padding shrinks to
+                # nothing once enough real days accumulate. Padded out to
+                # the same DAILY_CHARTS_WINDOW_DAYS as the window itself, so
+                # the chart always shows a fixed 14 day-slots.
+                display_end = max(
+                    latest_activity, daily_pipe_window_start + pd.Timedelta(days=DAILY_CHARTS_WINDOW_DAYS - 1)
+                )
+                date_range = pd.date_range(daily_pipe_window_start, display_end, freq="D")
+
+                produced_daily = (
+                    mapped_pipe_df[mapped_pipe_df["first_seen_date"] >= daily_pipe_window_start]
+                    .groupby(mapped_pipe_df["first_seen_date"].dt.normalize())
+                    .size()
+                    .reindex(date_range, fill_value=0)
+                )
+                repaired_daily = (
+                    repaired_pipe_df[repaired_pipe_df["repaired_date"] >= daily_pipe_window_start]
+                    .groupby(repaired_pipe_df["repaired_date"].dt.normalize())
+                    .size()
+                    .reindex(date_range, fill_value=0)
+                )
+
+                # Backlog: +1 the day a pipe is first seen, -1 the day it's
+                # repaired (if ever), summed per day over the pipe's
+                # *entire* history, then cumulatively summed — so a pipe
+                # cut before the display window still correctly counts
+                # toward every window day's backlog until (and unless)
+                # it's repaired. Forward-fill within the real range so a
+                # day with no events keeps the prior day's level instead of
+                # dropping to 0.
+                opens_all = mapped_pipe_df.groupby(mapped_pipe_df["first_seen_date"].dt.normalize()).size()
+                closes_all = repaired_pipe_df.groupby(repaired_pipe_df["repaired_date"].dt.normalize()).size()
+                net_all = opens_all.sub(closes_all, fill_value=0)
+                full_history_range = pd.date_range(net_all.index.min(), latest_activity, freq="D")
+                backlog_series = net_all.reindex(full_history_range, fill_value=0).cumsum()
+                real_date_range = pd.date_range(daily_pipe_window_start, latest_activity, freq="D")
+                backlog_window_real = backlog_series.reindex(real_date_range, method="ffill")
+                # Reindexed onto the (possibly padded) display range
+                # *without* ffill — the padding dates beyond latest_activity
+                # are blank future days, not known data, so the stock line
+                # should stop at the last real point instead of drawing a
+                # fake flat continuation across them.
+                backlog_window = backlog_window_real.reindex(date_range)
+
+                # A continuous date axis infers bar width/spacing from the
+                # gap between neighboring x-values and the overall axis
+                # range — with very few days in the window (right after the
+                # floor date moves forward, or early in a fresh deployment)
+                # there's nothing to infer from, and both the bar width and
+                # the grouped-bar offset come out wrong (bars stretch to
+                # fill the whole plot and/or overlap each other instead of
+                # sitting side by side). A categorical axis with pre-
+                # formatted date labels sidesteps this entirely — same
+                # approach already used for "Compact Timeline" elsewhere on
+                # this dashboard — and grouped bars space correctly via
+                # Plotly's ordinary category math regardless of how sparse
+                # the dates are.
+                x_labels = [d.strftime("%d.%m.%y") for d in date_range]
+
+                daily_pipe_fig = go.Figure()
+                daily_pipe_fig.add_trace(
+                    go.Bar(
+                        x=x_labels,
+                        y=produced_daily.values,
+                        name="Produced",
+                        marker_color=COLOR_SECONDARY,
+                        texttemplate="%{y}",
+                        textposition="outside",
+                        hovertemplate="%{x}<br>Produced: <b>%{y}</b><extra></extra>",
+                    )
+                )
+                daily_pipe_fig.add_trace(
+                    go.Bar(
+                        x=x_labels,
+                        y=repaired_daily.values,
+                        name="Repaired",
+                        marker_color=COLOR_COIL,
+                        texttemplate="%{y}",
+                        textposition="outside",
+                        hovertemplate="%{x}<br>Repaired: <b>%{y}</b><extra></extra>",
+                    )
+                )
+                # Single shared axis (no secondary y) — bars and the stock
+                # line are drawn on the same "Pipe Count" scale, per
+                # request. The line is added last so it draws on top of
+                # the bars.
+                daily_pipe_fig.add_trace(
+                    go.Scatter(
+                        x=x_labels,
+                        y=backlog_window.values,
+                        name="Total Stock / Remaining Pipes",
+                        mode="lines+markers",
+                        line=dict(color=COLOR_DANGER, width=3),
+                        marker=dict(size=8, color=COLOR_DANGER, line=dict(color="white", width=1)),
+                        hovertemplate="%{x}<br>Total Stock: <b>%{y}</b> pipes<extra></extra>",
+                    )
+                )
+                daily_pipe_fig.update_layout(
+                    barmode="group",
+                    title="Backlog Trend",
+                    xaxis_title="Date",
+                    yaxis=dict(title="Pipe Count", rangemode="tozero"),
+                    template="plotly_white",
+                    margin=dict(l=40, r=40, t=70, b=40),
+                    hoverlabel=HOVER_STYLE,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                daily_pipe_fig.update_xaxes(type="category", tickangle=-45)
+
+                # Table alongside Daily Repair Amount below — same numbers
+                # as the chart, scannable without reading bar heights off
+                # the axis. Must slice from the real portion only
+                # (date_range/x_labels were padded with blank future dates
+                # above so the chart doesn't render absurdly fat bars with
+                # too few real days — the table has no such rendering
+                # constraint, so it should never show those placeholder
+                # days). Every real day is included (not truncated) — native
+                # pagination (page_size below) splits it 10-per-page, same
+                # as every other table in this app; newest day first.
+                real_day_count = (latest_activity - daily_pipe_window_start).days + 1
+                daily_pipe_table_df = pd.DataFrame(
+                    {
+                        "date": x_labels[:real_day_count],
+                        "produced": produced_daily.values[:real_day_count],
+                        "repaired": repaired_daily.values[:real_day_count],
+                        "stock": backlog_window.values[:real_day_count],
+                    }
+                ).iloc[::-1]
+                # Net = Produced - Repaired = literal day-over-day change in
+                # Stock (matches Stock exactly: negative means the backlog
+                # shrank that day, positive means it grew).
+                daily_pipe_table_df["net"] = (
+                    daily_pipe_table_df["produced"] - daily_pipe_table_df["repaired"]
+                )
+                daily_pipe_table = dash_table.DataTable(
+                    data=daily_pipe_table_df.to_dict("records"),
+                    columns=[
+                        {"name": "Date", "id": "date"},
+                        {"name": "Produced", "id": "produced", "type": "numeric"},
+                        {"name": "Repaired", "id": "repaired", "type": "numeric"},
+                        {"name": "Net", "id": "net", "type": "numeric", "format": Format(sign=Sign.positive)},
+                        {"name": "Stock", "id": "stock", "type": "numeric"},
+                    ],
+                    page_size=10,
+                    sort_action="native",
+                    style_table={"overflowX": "auto"},
+                    style_cell=TABLE_CELL_STYLE,
+                    style_header=TABLE_HEADER_STYLE,
+                    style_data_conditional=TABLE_CONDITIONAL_STYLE
+                    + [
+                        {"if": {"column_id": "produced"}, "color": COLOR_SECONDARY, "fontWeight": "600"},
+                        {"if": {"column_id": "repaired"}, "color": COLOR_COIL, "fontWeight": "600"},
+                        {"if": {"column_id": "stock"}, "fontWeight": "700"},
+                        # Net < 0 (Produced fewer than Repaired) shrinks the
+                        # backlog -- good. Net > 0 grows it -- flag it.
+                        {"if": {"column_id": "net", "filter_query": "{net} < 0"}, "color": "#16a34a"},
+                        {"if": {"column_id": "net", "filter_query": "{net} > 0"}, "color": COLOR_DANGER},
+                    ],
+                )
 
     # --- Worst-performing projects (latest day) ---
     worst = latest_df.sort_values("repair_ratio", ascending=False).head(10)
@@ -1322,13 +1527,14 @@ def _render_dashboard_inner(selected_unit):
                 ],
                 className="bubble-view-row",
             ),
+            *(
+                [dcc.Graph(id="daily-pipe-count-graph", figure=daily_pipe_fig)]
+                if daily_pipe_fig is not None
+                else []
+            ),
             html.Div(
                 [dcc.Graph(id="daily-amount-graph", figure=bar_fig, className="chart-half")]
-                + (
-                    [dcc.Graph(id="daily-pipe-count-graph", figure=daily_pipe_fig, className="chart-half")]
-                    if daily_pipe_fig is not None
-                    else []
-                ),
+                + ([html.Div(daily_pipe_table, className="chart-half")] if daily_pipe_table is not None else []),
                 className="chart-row",
             ),
             # Dummy target for the clientside hover-sync callback below —
@@ -1336,14 +1542,13 @@ def _render_dashboard_inner(selected_unit):
             # via native plotly_hover/plotly_unhover listeners; this div's
             # own content is never used.
             html.Div(id="daily-charts-hover-sync", style={"display": "none"}),
-            html.H3("Latest Day — Project Details"),
-            detail_table,
         ]
-    )
+    ), html.Div([html.H3("Latest Day — Project Details"), detail_table])
 
 
 @callback(
     Output("dashboard-content", "children"),
+    Output("dashboard-table-content", "children"),
     Output("dashboard-stage-1", "data"),
     Input("refresh-dashboard-btn", "n_clicks"),
     Input("import-confirm-result", "children"),  # auto-refresh after a successful import
@@ -1356,17 +1561,18 @@ def render_dashboard(_n_clicks, _import_result, selected_unit, active_tab):
     # instead of rebuilding content nobody can see on every unit-toggle/
     # refresh/import. Fires again once active_tab switches back here.
     if active_tab != "tab-dashboard":
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     # dashboard-stage-1 is what pipe-overview-content / the sub-chart
     # callbacks below chain off of (a lightweight signal, not this div's own
     # heavy children) — always write a fresh value here, even on error, or
     # a stuck signal would leave every downstream spinner spinning forever.
     try:
-        content = _render_dashboard_inner(selected_unit)
+        content, table_content = _render_dashboard_inner(selected_unit)
     except Exception:
         logging.exception("render_dashboard failed")
         content = _empty_state("Something went wrong loading the dashboard. Try refreshing.")
-    return content, time.time()
+        table_content = None
+    return content, table_content, time.time()
 
 
 # Hovering a bar in either of the two daily charts lightens the matching
@@ -1590,6 +1796,16 @@ def _box_plot_section(df: pd.DataFrame, x_col: str, x_label: str, title: str) ->
     doesn't depend on knowing how to read a box-and-whisker shape. Width is
     capped so a chart with only a handful of categories doesn't stretch
     edge-to-edge and look mostly empty."""
+    if df.empty:
+        # e.g. a project whose pipes are all still Awaiting Repair — no
+        # repair_ratio values exist yet at all. An empty px.box still
+        # renders (blank axes), but the caption's median()/min()/max() on
+        # an empty Series would show "nan%" three times, which reads as
+        # broken rather than "no data yet."
+        return html.Div(
+            html.P("No repaired pipes yet for this selection.", className="help-text"),
+            style={"maxWidth": "700px"},
+        )
     fig = _build_box_fig(df, x_col, x_label, title)
     ratios = df["repair_ratio_pct"]
     caption = html.P(
@@ -2027,20 +2243,27 @@ def render_project_trend(selected_sheet, selected_series, compact_toggle, active
         if compact:
             annotations += _gap_annotations(incl_df, "repair_ratio_incl_skelp", date_index, COLOR_MUTED, yshift=-22)
 
-    # Same rule as the other trend charts: only draw a trend line when a
-    # single series is isolated. The fit itself always uses the full
-    # (uncollapsed) project_df so a long flat stretch is weighted by its
-    # real duration; in compact mode only its two endpoints get plotted,
-    # since the categorical axis only has categories for the dates above
-    # and a straight line needs no more than its endpoints anyway.
-    if len(selected_series) == 1:
+    # Trend line only in Compact Timeline mode, only when a single series
+    # is isolated. Outside compact mode the fit would have to use the full
+    # uncollapsed history (every report row, including a dozen repeats of
+    # the same value on days nothing changed) — that misrepresents the
+    # trend by letting untouched days out-weigh the days something
+    # actually happened, so it's not shown at all rather than shown wrong.
+    # In compact mode the fit uses the collapsed (changed-days-only) frame
+    # instead, which doesn't have that problem.
+    if len(selected_series) == 1 and compact:
         value_col = "repair_ratio" if selected_series[0] == "Excl" else "repair_ratio_incl_skelp"
-        trend_trace = _build_trend_trace(project_df, value_col)
+        trend_input_df = excl_df if selected_series[0] == "Excl" else incl_df
+        trend_trace = _build_trend_trace(trend_input_df, value_col)
         if trend_trace is not None:
-            if compact:
-                start_date, end_date = project_df["date"].min(), project_df["date"].max()
-                trend_trace.x = [date_labels[start_date], date_labels[end_date]]
-                trend_trace.y = [trend_trace.y[0], trend_trace.y[-1]]
+            start_date, end_date = trend_input_df["date"].min(), trend_input_df["date"].max()
+            trend_trace.x = [date_labels[start_date], date_labels[end_date]]
+            trend_trace.y = [trend_trace.y[0], trend_trace.y[-1]]
+            # x is now a pre-formatted category label, not a real date —
+            # _build_trend_trace's own hovertemplate expects a date and
+            # formats it with %{x|%d.%m.%Y}, which on a plain string
+            # renders as garbage ("NaN.NaN.0NaN").
+            trend_trace.hovertemplate = "%{x}<br>Trend: <b>%{y:.2f}%</b><extra></extra>"
             fig.add_trace(trend_trace)
 
     if len(selected_series) == 2:
@@ -2136,6 +2359,7 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
     links_df = load_project_sheet_links()
+    master_df = load_master_data()
     label_map = _pipe_sheet_label_map(links_df)
     sheet_df = df[df["project_sheet"] == selected_sheet].sort_values("pipe_no")
     if sheet_df.empty:
@@ -2143,8 +2367,20 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
 
     sheet_label = label_map.get(selected_sheet, selected_sheet)
 
+    # A still-Awaiting-Repair pipe has no real repair_ratio at all (NaN,
+    # not 0) — feeding those into a repair-ratio chart doesn't just leave a
+    # gap, it actively misleads: Plotly's line traces skip NaN points
+    # entirely (so the "sequence" line looks broken/sparse rather than
+    # showing real spacing), and a rolling average computed with min_periods=1
+    # over mostly-NaN data collapses to whatever handful of real values
+    # happen to fall in each window, producing spurious spikes/"islands"
+    # that don't represent an actual 8-pipe average. The three charts below
+    # that plot repair_ratio directly use only already-repaired pipes; the
+    # detail table further down still shows every pipe, both statuses.
+    repaired_sheet_df = sheet_df[sheet_df["status"] == "Repaired"]
+
     worst_fig = px.bar(
-        worst_pipes(sheet_df, top_n=15),
+        worst_pipes(repaired_sheet_df, top_n=15),
         x="pipe_no",
         y="repair_ratio",
         labels={"pipe_no": "Pipe No.", "repair_ratio": "Repair Ratio"},
@@ -2161,42 +2397,112 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
     worst_fig.update_xaxes(type="category")
     worst_fig.update_yaxes(tickformat=".2%")
 
-    # Pipes are produced in pipe_no order, so plotting every pipe (not just
-    # the worst 15) against that order shows whether bad pipes cluster at
-    # the start or end of the run — a single continuous line (not one line
-    # per repair_category, which would connect non-adjacent same-category
-    # pipes across everything in between) with marker color flagging
-    # Coating vs Clutch. pipe_no stays numeric so gaps from never-logged
-    # pipes show up as real spacing instead of being hidden.
+    # Pipes are produced in pipe_no order, so plotting every pipe against
+    # that order (numeric axis, auto-ranging over the project's real
+    # pipe_no span) shows whether bad pipes cluster at the start or end of
+    # the run, with real gaps from never-repaired pipe numbers showing up
+    # as real spacing — a categorical axis was tried here and rejected: a
+    # production day isn't pipe_no-contiguous (e.g. one day can be pipes 1,
+    # 13 and 42), so per-day line segments made no sense once the axis
+    # needs to preserve numeric distance. One continuous line connects
+    # every point in true pipe_no order instead; only marker color carries
+    # the day.
+    #
+    # Marker color = production day, EXCEPT for pipes recorded before this
+    # app started tracking cut date separately from repair date
+    # (PIPE_TREND_FLOOR_DATE) — for those, first_seen_date is really just
+    # "day first uploaded as already repaired" (the old parser only ever
+    # captured pipes with repair data), not a real production date, so
+    # color-coding it as one would be misleading. Those get one flat
+    # neutral color instead of a day color.
+    sequence_df = repaired_sheet_df.sort_values("pipe_no")
+    is_tracked = sequence_df["first_seen_date"] >= PIPE_TREND_FLOOR_DATE
+
+    # Okabe-Ito colorblind-safe set — engineered so adjacent hues stay
+    # distinguishable under every common form of color vision deficiency.
+    # Assigned by each tracked day's chronological rank, not by x-position,
+    # so day N and day N+1 are never the same color regardless of how the
+    # pipe numbers happen to fall.
+    day_color_cycle = ["#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2"]
+    tracked_dates = sorted(sequence_df.loc[is_tracked, "first_seen_date"].unique())
+    date_to_color = {d: day_color_cycle[i % len(day_color_cycle)] for i, d in enumerate(tracked_dates)}
+
+    marker_colors = [
+        date_to_color[d] if tracked else COLOR_MUTED
+        for d, tracked in zip(sequence_df["first_seen_date"], is_tracked)
+    ]
+    hover_extra = [
+        f"Produced: {d.strftime('%d.%m.%Y')}" if tracked else "Pre-tracking pipe — production date not recorded"
+        for d, tracked in zip(sequence_df["first_seen_date"], is_tracked)
+    ]
+
     sequence_fig = go.Figure()
     sequence_fig.add_trace(
         go.Scatter(
-            x=sheet_df["pipe_no"],
-            y=sheet_df["repair_ratio"],
+            x=sequence_df["pipe_no"],
+            y=sequence_df["repair_ratio"],
             mode="lines+markers",
             name="Repair Ratio",
             line=dict(color=COLOR_COIL, width=1.5),
-            marker=dict(
-                size=6,
-                color=[_CATEGORY_COLORS.get(c, COLOR_COIL) for c in sheet_df["repair_category"]],
-            ),
-            customdata=sheet_df["repair_category"],
-            hovertemplate="Pipe %{x}<br>Repair Ratio: <b>%{y:.2%}</b><br>%{customdata}<extra></extra>",
+            marker=dict(size=6, color=marker_colors),
+            customdata=hover_extra,
+            hovertemplate="Pipe %{x}<br>%{customdata}<br>Repair Ratio: <b>%{y:.2%}</b><extra></extra>",
+            showlegend=False,
         )
     )
+    if not is_tracked.all():
+        # A visible legend entry for the neutral color specifically (the
+        # rotating day colors don't get one — with a 5-color rotation the
+        # same color can mean different days, so a color->date legend
+        # would be actively wrong, not just cluttered).
+        sequence_fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=6, color=COLOR_MUTED),
+                name="Pre-tracking (date unknown)",
+            )
+        )
+
+    # One date label per tracked production day, above its lowest pipe_no
+    # occurrence — only for days we actually know (pre-tracking pipes have
+    # no reliable date at all, so they get no label, matching how their
+    # hover text already omits a date). Capped the same way the old
+    # per-day-trace version was, so a project with many tracked days
+    # doesn't crowd the top of the chart.
+    if tracked_dates:
+        max_day_labels = 20
+        label_every = max(1, -(-len(tracked_dates) // max_day_labels))
+        tracked_only = sequence_df[is_tracked]
+        for i, day in enumerate(tracked_dates):
+            if i % label_every != 0:
+                continue
+            first_pipe_no = tracked_only.loc[tracked_only["first_seen_date"] == day, "pipe_no"].min()
+            sequence_fig.add_annotation(
+                x=first_pipe_no,
+                y=1.0,
+                yref="paper",
+                yshift=6,
+                text=pd.Timestamp(day).strftime("%d.%m"),
+                showarrow=False,
+                xanchor="left",
+                font=dict(size=9, color=date_to_color[day]),
+            )
+
     # Smoothed trend on top of the noisy per-pipe points — makes "is it
     # trending worse toward the start or end of the run" readable without
     # eyeballing every scattered point. min_periods=1 keeps this
     # well-behaved even on a 1-pipe sheet.
     rolling_window = 8 # at least 3 pipes, or 10% of the run
-    rolling_avg = sheet_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
+    rolling_avg = sequence_df["repair_ratio"].rolling(rolling_window, center=True, min_periods=1).mean()
     sequence_fig.add_trace(
         go.Scatter(
-            x=sheet_df["pipe_no"],
+            x=sequence_df["pipe_no"],
             y=rolling_avg,
             mode="lines",
             name=f"{rolling_window}-Pipe Rolling Avg",
-            line=dict(color=COLOR_SECONDARY, width=2, dash="dot"),
+            line=dict(color=COLOR_DANGER, width=2, dash="dot"),
             hovertemplate="Pipe %{x}<br>Rolling Avg: <b>%{y:.2%}</b><extra></extra>",
         )
     )
@@ -2205,8 +2511,31 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         xaxis_title="Pipe No.",
         yaxis_title="Repair Ratio",
         template="plotly_white",
-        margin=dict(l=40, r=20, t=50, b=40),
+        margin=dict(l=40, r=20, t=50, b=60),
         hoverlabel=HOVER_STYLE,
+        # Without an explicit position, Plotly reserves a vertical sidebar
+        # for the legend on the right, squeezing the actual plot into a
+        # narrow left portion of the figure — placed below the plot
+        # instead, matching the other charts in this file.
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5),
+    )
+    # Numeric axis (not categorical) so it auto-ranges over the project's
+    # real pipe_no span and gaps between repaired pipe numbers show up as
+    # real, proportional spacing instead of being compressed away. Plotly's
+    # own auto ticks for a numeric axis are sparse (e.g. every 10 units) —
+    # labeling every actual pipe instead (thinned only if there are too
+    # many to stay legible) keeps the true numeric spacing but shows far
+    # more of the real pipe numbers along the axis.
+    max_tick_labels = 40
+    pipe_no_values = sequence_df["pipe_no"].tolist()
+    tick_step = max(1, -(-len(pipe_no_values) // max_tick_labels))
+    tick_values = pipe_no_values[::tick_step]
+    sequence_fig.update_xaxes(
+        type="linear",
+        tickmode="array",
+        tickvals=tick_values,
+        ticktext=[str(v) for v in tick_values],
+        tickangle=-45,
     )
     # rangemode="tozero": with very few pipes (a 1-pipe project in the
     # extreme), Plotly's autorange has no real spread to work from and can
@@ -2214,11 +2543,81 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
     # for a single ~1% value) — anchoring at zero keeps the scale sane.
     sequence_fig.update_yaxes(tickformat=".2%", rangemode="tozero")
 
+    # How many of this project's pipes are still waiting on a repair,
+    # already produced, or not even cut yet. The first two come straight
+    # from sheet_df; "Planned" (not yet produced at all) has no signature
+    # to count directly — a not-yet-produced pipe has nothing written in
+    # its block at all, and raw "empty Excel block" counting was tried and
+    # found unreliable (leftover template artifacts are indistinguishable
+    # from real reserved slots — see the plan doc). Instead it's derived
+    # from the project's own target quantity (repair_rates.qty, the Daily
+    # Repair Rate sheet's planned/contract count) minus how many pipes
+    # already exist here.
+    status_counts = sheet_df["status"].value_counts().to_dict()
+    produced_count = len(sheet_df)
+    target_qty = None
+    remaining = None
+    confirmed_links = links_df[links_df["status"] == "confirmed"]
+    link_match = confirmed_links[confirmed_links["project_sheet"] == selected_sheet]
+    if not link_match.empty:
+        project_no = link_match.iloc[0]["project_no"]
+        dimensions = link_match.iloc[0]["dimensions"]
+        project_master_df = master_df[
+            (master_df["project_no"] == project_no) & (master_df["dimensions"] == dimensions)
+        ]
+        if not project_master_df.empty:
+            qty = project_master_df.loc[project_master_df["date"].idxmax(), "qty"]
+            if pd.notna(qty):
+                target_qty = int(qty)
+                remaining = max(target_qty - produced_count, 0)
+
+    awaiting_repair_label = STATUS_DISPLAY_LABELS["Produced"]
+    pie_entries = [
+        ("Repaired", status_counts.get("Repaired", 0), COLOR_COIL),
+        (awaiting_repair_label, status_counts.get("Produced", 0), COLOR_SECONDARY),
+    ]
+    if remaining is not None:
+        pie_entries.append(("Planned", remaining, COLOR_MUTED))
+    # Drop zero-value slices — Plotly still places a text label for a 0%
+    # wedge (invisible slice, but not an invisible label), which collided
+    # with its neighbor's label instead of just not being there.
+    pie_entries = [entry for entry in pie_entries if entry[1] > 0]
+    pie_names = [name for name, _, _ in pie_entries]
+    pie_values = [value for _, value, _ in pie_entries]
+    pie_colors = {name: color for name, _, color in pie_entries}
+
+    status_fig = px.pie(
+        names=pie_names,
+        values=pie_values,
+        title=f"Pipe Status — {sheet_label}",
+        color=pie_names,
+        color_discrete_map=pie_colors,
+        hole=0.45,
+    )
+    status_fig.update_traces(
+        textinfo="value+percent",
+        textposition="inside",
+        insidetextorientation="radial",
+        hovertemplate="%{label}: <b>%{value}</b> pipes (%{percent})<extra></extra>",
+    )
+    status_fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=50, b=20), hoverlabel=HOVER_STYLE)
+    status_caption = None
+    if target_qty is not None:
+        # Mirrors the pie's own labels exactly (Repaired / Awaiting Repair /
+        # Planned) instead of a lumped "produced so far" figure — that
+        # phrasing was easy to misread against the Awaiting Repair count
+        # right next to it, the same ambiguity the pie relabel just fixed.
+        status_caption = html.P(
+            f"Target Qty: {target_qty} · Repaired: {status_counts.get('Repaired', 0)} · "
+            f"{awaiting_repair_label}: {status_counts.get('Produced', 0)} · Planned: {remaining}",
+            className="help-text",
+        )
+
     # Distribution of this one project's pipe ratios — median/quartiles/
     # outliers in a single box, complementing the production-order line
     # above (which shows *where* in the run things went wrong; this shows
     # *how consistent* the whole run was).
-    box_df = sheet_df[["repair_ratio"]].copy()
+    box_df = repaired_sheet_df[["repair_ratio"]].copy()
     box_df["project_label"] = sheet_label
     box_df["repair_ratio_pct"] = (box_df["repair_ratio"] * 100).round(4)
     box_section = _box_plot_section(
@@ -2233,6 +2632,12 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         sheet_df["pipe_length_ft"] = length_in_display_unit(sheet_df["pipe_length_ft"], selected_unit)
     if "repair_amount" in sheet_df.columns:
         sheet_df["repair_amount"] = amount_in_display_unit(sheet_df["repair_amount"], selected_unit)
+    if "repaired_date" in sheet_df.columns:
+        # NaT (a still-Produced pipe) formats to None, not a crash — renders
+        # as a blank cell same as the null repair_amount/repair_ratio above.
+        sheet_df["repaired_date"] = sheet_df["repaired_date"].dt.strftime("%d.%m.%Y")
+    if "status" in sheet_df.columns:
+        sheet_df["status"] = sheet_df["status"].replace(STATUS_DISPLAY_LABELS)
 
     detail_columns = [
         c
@@ -2254,16 +2659,21 @@ def render_pipe_analysis(selected_sheet, selected_unit, active_tab):
         style_data_conditional=TABLE_CONDITIONAL_STYLE,
     )
 
-    return html.Div(
+    children = [
+        html.H3(f"{sheet_label} — Pipe Details"),
+        dcc.Graph(figure=status_fig, style={"maxWidth": "500px"}),
+    ]
+    if status_caption is not None:
+        children.append(status_caption)
+    children.extend(
         [
-            html.H3(f"{sheet_label} — Pipe Details"),
             dcc.Graph(figure=worst_fig),
             dcc.Graph(figure=sequence_fig),
-            html.P("Point color marks the repair type: blue = Coating, orange = Clutch.", className="help-text"),
             box_section,
             detail_table,
         ]
     )
+    return html.Div(children)
 
 
 # ---------------------------------------------------------------------------
@@ -2403,31 +2813,6 @@ def render_comparison(selected_sheets, selected_series, compact_toggle, selected
             trend_annotations += _gap_annotations(
                 series_df, meta["col"], date_index, color, yshift=22 if series == "Excl" else -22
             )
-
-    # Trend-line fit: same rule as every other trend chart — only drawn
-    # when a single series is isolated, one dotted line per project so the
-    # slope comparison itself stays readable.
-    if len(selected_series) == 1:
-        series = selected_series[0]
-        value_col = SERIES_META[series]["col"]
-        for i, p in enumerate(projects):
-            proj_df = selected_master_df[selected_master_df["sheet"] == p["sheet"]].sort_values("date")
-            proj_df = proj_df[proj_df["date"] >= window_start]
-            trend_trace = _build_trend_trace(proj_df, value_col)
-            if trend_trace is None:
-                continue
-            color = palette[i % len(palette)]
-            trend_trace.line.color = color
-            trend_trace.line.width = 1.5
-            trend_trace.name = f"{p['label']} Trend"
-            if compact:
-                series_df = per_project_series.get((i, series))
-                start_date, end_date = proj_df["date"].min(), proj_df["date"].max()
-                if series_df is None or series_df.empty or start_date not in date_labels or end_date not in date_labels:
-                    continue
-                trend_trace.x = [date_labels[start_date], date_labels[end_date]]
-                trend_trace.y = [trend_trace.y[0], trend_trace.y[-1]]
-            trend_fig.add_trace(trend_trace)
 
     trend_fig.update_layout(
         title="Repair Ratio Trend (Selected Projects)",
@@ -2685,11 +3070,16 @@ def render_dimension_overview(_stage_2, selected_unit):
 
 @callback(
     Output("dimension-detail-content", "children"),
+    Output("dimension-detail-table-content", "children"),
     Input("dimension-detail-dropdown", "value"),
 )
 def render_dimension_detail(selected_dimension):
+    """Returns (chart_content, table_content) — split so the table lands in
+    the dedicated Tables section at the bottom of the page instead of in
+    the middle of this dimension's charts."""
     if not selected_dimension:
-        return _empty_state("No data available. Import an Excel file first.")
+        empty = _empty_state("No data available. Import an Excel file first.")
+        return empty, None
 
     master_df = load_master_data()
     _latest_date, latest_df = _latest_day_frame(master_df)
@@ -2698,7 +3088,8 @@ def render_dimension_detail(selected_dimension):
         "repair_ratio", ascending=False
     ).copy()
     if dim_df.empty:
-        return _empty_state("No projects found for this dimension on the latest day.")
+        empty = _empty_state("No projects found for this dimension on the latest day.")
+        return empty, None
 
     # Repair-ratio chart — same clean (no 20XXQ- prefix) label as the
     # dashboard's ratio charts, with qty shown inside the bar instead.
@@ -2781,7 +3172,6 @@ def render_dimension_detail(selected_dimension):
         html.H3(f"Dimension {selected_dimension} — Detail"),
         dcc.Graph(figure=trend_fig),
         dcc.Graph(figure=fig),
-        table,
     ]
 
     # Pipe-level distribution, one box per project sharing this dimension —
@@ -2808,4 +3198,5 @@ def render_dimension_detail(selected_dimension):
             )
             children.append(box_section)
 
-    return html.Div(children)
+    table_content = html.Div([html.H3(f"Dimension {selected_dimension} — Detail Table"), table])
+    return html.Div(children), table_content

@@ -1,7 +1,8 @@
-// Links the "Daily Repair Amount" and "Pipes Repaired per Day" bar charts
-// (pages/home.py, render_dashboard) so hovering a bar on one lightens the
-// matching date's bar on the other — makes it easy to compare "how much"
-// vs "how many" for the same day without hunting across two charts.
+// Links the "Daily Repair Amount" bar chart and the "Daily Production vs.
+// Repair, and Backlog Trend" chart (pages/home.py, render_dashboard) so
+// hovering a bar on one lightens the matching date's bars on the other —
+// makes it easy to compare "how much" vs "how many" for the same day
+// without hunting across two charts.
 //
 // Wired directly to Plotly's own plotly_hover/plotly_unhover events on each
 // graph div (not through Dash's hoverData prop): hoverData didn't reliably
@@ -15,21 +16,40 @@ function _dailySyncPlotDiv(id) {
     return wrapper ? wrapper.querySelector(".js-plotly-plot") : null;
 }
 
-function _dailySyncResetColors(div, baseColor) {
+// "Daily Repair Amount" stays on a continuous date axis (x = ISO-ish
+// datetime strings); the pipe chart uses a categorical axis with
+// pre-formatted "dd.mm.yy" labels (see render_dashboard — a continuous
+// date axis with very few days breaks grouped-bar width/offset). Reduce
+// both to the same "yyyy-mm-dd" key so hover matching still works across
+// the two different x-axis representations.
+function _dailySyncDateKey(x) {
+    var s = String(x);
+    var m = s.match(/^(\d{2})\.(\d{2})\.(\d{2})$/);
+    if (m) {
+        return "20" + m[3] + "-" + m[2] + "-" + m[1];
+    }
+    return s.slice(0, 10);
+}
+
+// traceIndices restricts the restyle to specific traces (e.g. just the bar
+// traces, leaving a secondary-axis line trace's own color alone) — mirrors
+// the Pareto sync functions below. Omitting it (amountDiv's single-bar
+// chart) restyles every trace, same as before.
+function _dailySyncResetColors(div, baseColor, traceIndices) {
     if (!div || !div.data || !div.data.length) return;
     var n = div.data[0].x.length;
     var colors = [];
     for (var i = 0; i < n; i++) colors.push(baseColor);
-    Plotly.restyle(div, { "marker.color": [colors] });
+    Plotly.restyle(div, { "marker.color": [colors] }, traceIndices);
 }
 
-function _dailySyncHighlightMatch(div, baseColor, lightColor, hoveredDate) {
+function _dailySyncHighlightMatch(div, baseColor, lightColor, hoveredDateKey, traceIndices) {
     if (!div || !div.data || !div.data.length) return;
     var xValues = div.data[0].x;
     var colors = xValues.map(function (x) {
-        return String(x).slice(0, 10) === hoveredDate ? lightColor : baseColor;
+        return _dailySyncDateKey(x) === hoveredDateKey ? lightColor : baseColor;
     });
-    Plotly.restyle(div, { "marker.color": [colors] });
+    Plotly.restyle(div, { "marker.color": [colors] }, traceIndices);
 }
 
 function _wireDailyChartsSync() {
@@ -42,20 +62,42 @@ function _wireDailyChartsSync() {
 
     var AMOUNT_COLOR = "#2563eb";
     var AMOUNT_LIGHT = "rgba(37, 99, 235, 0.45)";
-    var PIPE_COLOR = "#f97316";
-    var PIPE_LIGHT = "rgba(249, 115, 22, 0.45)";
+    // The pipe chart now has two bar traces (Produced=orange, Repaired=blue)
+    // plus a stock-level line (same shared axis, drawn on top) — only
+    // traces 0/1 (the bars) get restyled on hover-sync; the line trace (2)
+    // keeps its own fixed color untouched.
+    var PIPE_BAR_TRACES = [0, 1];
+    var PIPE_PRODUCED_COLOR = "#f97316";
+    var PIPE_PRODUCED_LIGHT = "rgba(249, 115, 22, 0.45)";
+    var PIPE_REPAIRED_COLOR = "#2563eb";
+    var PIPE_REPAIRED_LIGHT = "rgba(37, 99, 235, 0.45)";
 
     amountDiv.on("plotly_hover", function (evt) {
         if (!evt.points || !evt.points.length) return;
-        _dailySyncHighlightMatch(pipeDiv, PIPE_COLOR, PIPE_LIGHT, String(evt.points[0].x).slice(0, 10));
+        var hoveredDateKey = _dailySyncDateKey(evt.points[0].x);
+        if (!pipeDiv || !pipeDiv.data || pipeDiv.data.length < 2) return;
+        var producedColors = pipeDiv.data[0].x.map(function (x) {
+            return _dailySyncDateKey(x) === hoveredDateKey ? PIPE_PRODUCED_LIGHT : PIPE_PRODUCED_COLOR;
+        });
+        var repairedColors = pipeDiv.data[1].x.map(function (x) {
+            return _dailySyncDateKey(x) === hoveredDateKey ? PIPE_REPAIRED_LIGHT : PIPE_REPAIRED_COLOR;
+        });
+        Plotly.restyle(pipeDiv, { "marker.color": [producedColors, repairedColors] }, PIPE_BAR_TRACES);
     });
     amountDiv.on("plotly_unhover", function () {
-        _dailySyncResetColors(pipeDiv, PIPE_COLOR);
+        if (!pipeDiv || !pipeDiv.data || pipeDiv.data.length < 2) return;
+        var n0 = pipeDiv.data[0].x.length;
+        var n1 = pipeDiv.data[1].x.length;
+        var producedColors = [];
+        for (var i = 0; i < n0; i++) producedColors.push(PIPE_PRODUCED_COLOR);
+        var repairedColors = [];
+        for (var j = 0; j < n1; j++) repairedColors.push(PIPE_REPAIRED_COLOR);
+        Plotly.restyle(pipeDiv, { "marker.color": [producedColors, repairedColors] }, PIPE_BAR_TRACES);
     });
 
     pipeDiv.on("plotly_hover", function (evt) {
         if (!evt.points || !evt.points.length) return;
-        _dailySyncHighlightMatch(amountDiv, AMOUNT_COLOR, AMOUNT_LIGHT, String(evt.points[0].x).slice(0, 10));
+        _dailySyncHighlightMatch(amountDiv, AMOUNT_COLOR, AMOUNT_LIGHT, _dailySyncDateKey(evt.points[0].x));
     });
     pipeDiv.on("plotly_unhover", function () {
         _dailySyncResetColors(amountDiv, AMOUNT_COLOR);

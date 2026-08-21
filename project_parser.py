@@ -6,8 +6,14 @@ Each pipe is recorded as a fixed-size block (an anchor cell containing a
 "Repair ... Rate :" label, with the pipe number, repair amount, repair
 count, and surface state a few rows below it). A block's ratio value sits
 either under the "Coating" side or the "Clutch" side of the block — whichever
-one is filled in determines the pipe's repair category; empty blocks are
-unused template slots and are skipped.
+one is filled in determines the pipe's repair category; a block with no
+ratio value on either side at all is a genuinely unused template slot and
+is skipped.
+
+A pipe can appear with just its number and production length filled in and
+everything else blank — cut, but not yet repaired. That's recorded too, as
+status="Produced" (see _parse_sheet), and turns into status="Repaired" once
+a later day's upload shows real repair data for the same block.
 """
 
 from __future__ import annotations
@@ -108,20 +114,27 @@ def _load_sheet_grid(ws) -> dict[tuple[int, int], object]:
 
 def _extract_block(
     grid: dict[tuple[int, int], object], anchor_row: int, anchor_col: int, pipe_no_offset: int, data_offset: int
-) -> tuple[float, float | None, float, float | None, str | None] | None:
+) -> tuple[float, float | None, float | None, float | None, str | None] | None:
     """Try to pull pipe_no/length/amount/count/surface_state out of a block
-    using the given row offsets. Returns None if pipe_no or repair_amount
-    is missing at these offsets (either a genuinely unused template slot,
-    or the wrong offset pair for this sheet's template)."""
+    using the given row offsets. Returns None if pipe_no is missing at
+    these offsets (either a genuinely unused template slot, or the wrong
+    offset pair for this sheet's template).
+
+    repair_amount (and therefore repair_count) can legitimately come back
+    None: a pipe that's been produced/cut but not yet repaired has its
+    number and length filled in, but the amount/count cells stay blank
+    until a repair is actually logged, possibly days later. See
+    _parse_sheet for how that's turned into a "Produced" vs. "Repaired"
+    status."""
     pipe_no_row = anchor_row + pipe_no_offset
     data_row = anchor_row + data_offset
 
     pipe_no = coerce_number(grid.get((pipe_no_row, anchor_col + 1)))
-    repair_amount = coerce_number(grid.get((data_row, anchor_col + 1)))
-    if pipe_no is None or repair_amount is None:
+    if pipe_no is None:
         return None
 
     pipe_length_ft = _parse_length_ft(grid.get((pipe_no_row, anchor_col)))
+    repair_amount = coerce_number(grid.get((data_row, anchor_col + 1)))
     repair_count = coerce_number(grid.get((data_row, anchor_col + 3)))
     surface_state = normalize_spaces(grid.get((data_row, anchor_col + 4)))
     return pipe_no, pipe_length_ft, repair_amount, repair_count, surface_state
@@ -157,6 +170,13 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
 
         pipe_no, pipe_length_ft, repair_amount, repair_count, surface_state = extracted
 
+        # A pipe that's only been produced, not yet repaired, still has a
+        # literal 0 in its Coating/Clutch/alt ratio cell (that's how its
+        # category is knowable at all before repair) — but 0% isn't a real
+        # repair ratio, it's the template's unrepaired placeholder, so only
+        # keep it once repair_amount confirms a repair actually happened.
+        status = "Repaired" if repair_amount is not None else "Produced"
+
         rows.append(
             {
                 "date": report_date_iso,
@@ -165,10 +185,11 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
                 "pipe_no": int(pipe_no),
                 "pipe_length_ft": pipe_length_ft,
                 "repair_amount": repair_amount,
-                "repair_ratio": repair_ratio,
+                "repair_ratio": repair_ratio if repair_amount is not None else None,
                 "repair_count": int(repair_count) if repair_count is not None else None,
                 "repair_category": repair_category,
                 "surface_state": surface_state or None,
+                "status": status,
             }
         )
     return rows

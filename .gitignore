@@ -5,9 +5,10 @@ venv/
 env/
 .env
 data/
+backups/
 *.sqlite
 *.db
 *.xlsx
 *.pdf
-*.md
 .DS_Store
+*.md
