@@ -1060,9 +1060,13 @@ def _render_dashboard_inner(selected_unit):
                         x=x_labels,
                         y=backlog_window.values,
                         name="Total Stock / Remaining Pipes",
-                        mode="lines+markers",
+                        mode="lines+markers+text",
                         line=dict(color=COLOR_DANGER, width=3),
                         marker=dict(size=8, color=COLOR_DANGER, line=dict(color="white", width=1)),
+                        text=backlog_window.values,
+                        texttemplate="%{text}",
+                        textposition="top center",
+                        textfont=dict(color=COLOR_DANGER),
                         hovertemplate="%{x}<br>Total Stock: <b>%{y}</b> pipes<extra></extra>",
                     )
                 )
@@ -1621,42 +1625,69 @@ def _render_pipe_overview_inner(selected_unit):
             "feature/project-sheet-mapping-tool branch to link sheets first."
         )
 
-    # Flat list of whichever pipes were first repaired on the most recent
-    # activity date — no date picker here (that's what Project Trend and
-    # the per-project pages are for); this is just "what's newest, right now".
-    latest_date = mapped_df["first_seen_date"].max()
-    newest_df = mapped_df[mapped_df["first_seen_date"] == latest_date]
+    # Two independent "what's newest, right now" views — no date picker here
+    # (that's what Project Trend and the per-project pages are for).
+    # first_seen_date freezes at each pipe's original production/cut date, so
+    # filtering on it surfaces fresh production activity; repaired_date is
+    # the separate field for fresh repair activity, and the two dates often
+    # differ (a pipe can be cut today and repaired days later, or repaired
+    # today after being cut earlier) — hence two tables, not one.
     confirmed_links = links_df[links_df["status"] == "confirmed"][["project_sheet", "project_no", "dimensions"]]
-    newest_df = newest_df.merge(confirmed_links, on="project_sheet", how="left").copy()
-    if "repair_amount" in newest_df.columns:
-        newest_df["repair_amount"] = amount_in_display_unit(newest_df["repair_amount"], selected_unit)
     newest_columns = ["project_no", "dimensions", "pipe_no", "repair_amount", "repair_ratio"]
-    newest_df = newest_df[newest_columns].sort_values(["project_no", "pipe_no"])
-    newest_section = html.Div(
-        [
-            html.H3(f"Newest Pipes — {pd.Timestamp(latest_date).strftime('%d.%m.%Y')}"),
-            dash_table.DataTable(
-                data=_table_records(newest_df, newest_columns),
-                columns=_table_columns(
-                    newest_columns,
-                    label_overrides={
-                        "project_no": "Project",
-                        "pipe_no": "Pipe No.",
-                        "repair_amount": f"Repair Amount ({u})",
-                    },
+
+    def _newest_table(source_df: pd.DataFrame, title: str) -> html.Div:
+        table_df = source_df.merge(confirmed_links, on="project_sheet", how="left").copy()
+        if "repair_amount" in table_df.columns:
+            table_df["repair_amount"] = amount_in_display_unit(table_df["repair_amount"], selected_unit)
+        table_df = table_df[newest_columns].sort_values(["project_no", "pipe_no"])
+        return html.Div(
+            [
+                html.H3(title),
+                dash_table.DataTable(
+                    data=_table_records(table_df, newest_columns),
+                    columns=_table_columns(
+                        newest_columns,
+                        label_overrides={
+                            "project_no": "Project",
+                            "pipe_no": "Pipe No.",
+                            "repair_amount": f"Repair Amount ({u})",
+                        },
+                    ),
+                    page_size=15,
+                    sort_action="native",
+                    filter_action="native",
+                    style_table={"overflowX": "auto"},
+                    style_cell=TABLE_CELL_STYLE,
+                    style_header=TABLE_HEADER_STYLE,
+                    style_data_conditional=TABLE_CONDITIONAL_STYLE,
                 ),
-                page_size=15,
-                sort_action="native",
-                filter_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell=TABLE_CELL_STYLE,
-                style_header=TABLE_HEADER_STYLE,
-                style_data_conditional=TABLE_CONDITIONAL_STYLE,
-            ),
-        ]
+            ],
+            className="chart-half",
+        )
+
+    tables = []
+
+    produced_latest_date = mapped_df["first_seen_date"].max()
+    produced_df = mapped_df[mapped_df["first_seen_date"] == produced_latest_date]
+    tables.append(
+        _newest_table(
+            produced_df,
+            f"Newest Produced Pipes — {pd.Timestamp(produced_latest_date).strftime('%d.%m.%Y')}",
+        )
     )
 
-    return html.Div([newest_section])
+    repaired_only = mapped_df[mapped_df["repaired_date"].notna()]
+    if not repaired_only.empty:
+        repaired_latest_date = repaired_only["repaired_date"].max()
+        repaired_df = repaired_only[repaired_only["repaired_date"] == repaired_latest_date]
+        tables.append(
+            _newest_table(
+                repaired_df,
+                f"Newest Repaired Pipes — {pd.Timestamp(repaired_latest_date).strftime('%d.%m.%Y')}",
+            )
+        )
+
+    return html.Div([html.Div(tables, className="chart-row")])
 
 
 @callback(
