@@ -39,6 +39,17 @@ NON_PROJECT_SHEETS = {
 }
 
 _LABEL_PREFIX = "repairrate"
+# A handful of blocks on some sheets have had their anchor cell's formula
+# rewritten to unconditionally concatenate text (e.g. `="Repair R: " &
+# TEXT(ratio, "0.00%")`), which always evaluates to a string like
+# "Repair R: 3.79%" regardless of repair state — a second valid anchor shape.
+_LABEL_PREFIX_ALT = "repairr:"
+# The reformatted anchor bakes its ratio straight into the label text (e.g.
+# "repairr:3.79%" once normalized) instead of leaving a separate numeric cell
+# to gate on — this pulls that value back out so these blocks aren't stuck
+# permanently unreadable just because their neighboring "Coating"/"Clutch"
+# cell is now a plain category string, not a number.
+_ALT_LABEL_RATIO_RE = re.compile(r"repairr:([\d.]+)%")
 # Label formats seen across sheets: "129' 8\" ft" (feet+inches) and
 # "134.54 FT" / "134.54 ft" / "65 feet" (decimal feet, "ft" or spelled out).
 _LENGTH_FT_IN_RE = re.compile(r"(\d+)\s*'\s*(\d+)?\s*\"")
@@ -73,7 +84,8 @@ class ProjectParseReport:
 def _is_label_cell(value: object) -> bool:
     if not isinstance(value, str):
         return False
-    return value.replace(" ", "").lower().startswith(_LABEL_PREFIX)
+    normalized = value.replace(" ", "").lower()
+    return normalized.startswith(_LABEL_PREFIX) or normalized.startswith(_LABEL_PREFIX_ALT)
 
 
 def _parse_length_ft(value: object) -> float | None:
@@ -146,9 +158,16 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
 
     rows: list[dict] = []
     for anchor_row, anchor_col in anchors:
-        coating_ratio = coerce_number(grid.get((anchor_row, anchor_col)))
-        clutch_ratio = coerce_number(grid.get((anchor_row, anchor_col + 2)))
+        anchor_value = grid.get((anchor_row, anchor_col))
+        category_hint = grid.get((anchor_row, anchor_col + 2))
+        coating_ratio = coerce_number(anchor_value)
+        clutch_ratio = coerce_number(category_hint)
         alt_ratio = coerce_number(grid.get((anchor_row, anchor_col + RATIO_COL_OFFSET_ALT)))
+        label_ratio = None
+        if isinstance(anchor_value, str):
+            match = _ALT_LABEL_RATIO_RE.search(anchor_value.replace(" ", "").lower())
+            if match:
+                label_ratio = float(match.group(1)) / 100.0
 
         if coating_ratio is not None:
             repair_ratio, repair_category = coating_ratio, "Coating"
@@ -156,6 +175,9 @@ def _parse_sheet(ws, sheet_name: str, report_date_iso: str, report: ProjectParse
             repair_ratio, repair_category = clutch_ratio, "Clutch"
         elif alt_ratio is not None:
             repair_ratio, repair_category = alt_ratio, "Coating"
+        elif label_ratio is not None:
+            hint = category_hint.strip().lower() if isinstance(category_hint, str) else ""
+            repair_ratio, repair_category = label_ratio, ("Clutch" if hint == "clutch" else "Coating")
         else:
             continue  # unused template slot, not an actual pipe entry
 
