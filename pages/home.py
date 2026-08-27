@@ -1667,16 +1667,28 @@ def _render_pipe_overview_inner(selected_unit):
 
     tables = []
 
-    produced_latest_date = mapped_df["first_seen_date"].max()
-    produced_df = mapped_df[mapped_df["first_seen_date"] == produced_latest_date]
-    tables.append(
-        _newest_table(
-            produced_df,
-            f"Newest Produced Pipes — {pd.Timestamp(produced_latest_date).strftime('%d.%m.%Y')}",
+    # Pre-floor pipes come from the old system, where the *production* date
+    # in particular is really a proxy rather than a true date (same reasoning
+    # as the sequence chart's is_tracked split and the daily chart's window
+    # clamp — see PIPE_TREND_FLOOR_DATE). That only taints first_seen_date,
+    # though — a pipe produced before the floor can still have a perfectly
+    # trustworthy, current repaired_date (e.g. cut in the old system, only
+    # actually repaired now), so each table filters on its own relevant
+    # field rather than excluding a pipe from both based on either one.
+    produced_only = mapped_df[mapped_df["first_seen_date"] >= PIPE_TREND_FLOOR_DATE]
+    if not produced_only.empty:
+        produced_latest_date = produced_only["first_seen_date"].max()
+        produced_df = produced_only[produced_only["first_seen_date"] == produced_latest_date]
+        tables.append(
+            _newest_table(
+                produced_df,
+                f"Newest Produced Pipes — {pd.Timestamp(produced_latest_date).strftime('%d.%m.%Y')}",
+            )
         )
-    )
 
-    repaired_only = mapped_df[mapped_df["repaired_date"].notna()]
+    repaired_only = mapped_df[
+        mapped_df["repaired_date"].notna() & (mapped_df["repaired_date"] >= PIPE_TREND_FLOOR_DATE)
+    ]
     if not repaired_only.empty:
         repaired_latest_date = repaired_only["repaired_date"].max()
         repaired_df = repaired_only[repaired_only["repaired_date"] == repaired_latest_date]
@@ -1686,6 +1698,9 @@ def _render_pipe_overview_inner(selected_unit):
                 f"Newest Repaired Pipes — {pd.Timestamp(repaired_latest_date).strftime('%d.%m.%Y')}",
             )
         )
+
+    if not tables:
+        return _empty_state("No tracked pipe activity yet (only pre-tracking legacy data on file).")
 
     return html.Div([html.Div(tables, className="chart-row")])
 
