@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS project_sheet_links (
     dimensions TEXT,
     status TEXT NOT NULL DEFAULT 'confirmed',
     match_score REAL,
+    dates_reliable INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(project_sheet)
 );
@@ -332,6 +333,9 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
         conn.execute("ALTER TABLE pipe_repair_details ADD COLUMN status TEXT NOT NULL DEFAULT 'Repaired'")
     if "repaired_date" not in pipe_columns:
         conn.execute("ALTER TABLE pipe_repair_details ADD COLUMN repaired_date TEXT")
+    link_columns = {row["name"] for row in conn.execute("PRAGMA table_info(project_sheet_links)").fetchall()}
+    if "dates_reliable" not in link_columns:
+        conn.execute("ALTER TABLE project_sheet_links ADD COLUMN dates_reliable INTEGER NOT NULL DEFAULT 1")
     conn.commit()
     if should_close:
         conn.close()

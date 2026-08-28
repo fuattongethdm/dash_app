@@ -946,7 +946,7 @@ def _render_dashboard_inner(selected_unit):
     daily_pipe_table = None
     pipe_df_for_daily = load_pipe_repair_details()
     if not pipe_df_for_daily.empty:
-        pipe_label_map = _pipe_sheet_label_map(load_project_sheet_links())
+        pipe_label_map = _pipe_sheet_label_map(load_project_sheet_links(), trusted_only=True)
         mapped_pipe_df = pipe_df_for_daily[pipe_df_for_daily["project_sheet"].isin(pipe_label_map)]
         if not mapped_pipe_df.empty:
             repaired_pipe_df = mapped_pipe_df[mapped_pipe_df["status"] == "Repaired"]
@@ -1617,7 +1617,7 @@ def _render_pipe_overview_inner(selected_unit):
         return _empty_state("No pipe-level data in the database yet. Import an Excel file first.")
 
     links_df = load_project_sheet_links()
-    label_map = _pipe_sheet_label_map(links_df)
+    label_map = _pipe_sheet_label_map(links_df, trusted_only=True)
     mapped_df = df[df["project_sheet"].isin(label_map)]
     if mapped_df.empty:
         return _empty_state(
@@ -2341,13 +2341,25 @@ def render_project_trend(selected_sheet, selected_series, compact_toggle, active
 # Callback 5: Pipe-Level Analysis — populate the project dropdown
 # ---------------------------------------------------------------------------
 
-def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
+def _pipe_sheet_label_map(links_df: pd.DataFrame, trusted_only: bool = False) -> dict[str, str]:
     """project_sheet -> "project_no (dimensions)" for sheets confirmed via the
     "Project Mapping" review tool (feature/project-sheet-mapping-tool branch).
-    Sheets with no confirmed mapping are simply absent from this map."""
+    Sheets with no confirmed mapping are simply absent from this map.
+
+    trusted_only additionally drops sheets flagged dates_reliable=False —
+    for a project captured under conditions (e.g. a gap in daily uploads)
+    that make first_seen_date/repaired_date provably wrong rather than just
+    old, so cross-project date-based aggregates (Newest Produced/Repaired,
+    the daily Backlog Trend/Repair Amount charts) don't get skewed by them.
+    Single-project views (Pipe Analysis, Comparison) intentionally keep
+    using the unfiltered map — the user can still pick such a project there
+    on purpose. Missing/NULL dates_reliable (or the column not existing yet,
+    pre-migration) defaults to trusted, same as the column's own DB default."""
     if links_df.empty:
         return {}
     confirmed = links_df[links_df["status"] == "confirmed"]
+    if trusted_only and "dates_reliable" in confirmed.columns:
+        confirmed = confirmed[confirmed["dates_reliable"].fillna(True).astype(bool)]
     labels = confirmed["project_no"].astype(str) + " (" + confirmed["dimensions"].astype(str) + ")"
     return dict(zip(confirmed["project_sheet"], labels))
 

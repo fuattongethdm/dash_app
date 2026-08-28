@@ -92,3 +92,18 @@ alter table project_group_configs enable row level security;
 -- -- repaired_date, backfilled from first_seen_date (the closest available
 -- -- approximation for pipes repaired before this feature existed).
 -- update pipe_repair_details set repaired_date = first_seen_date where repaired_date is null;
+
+-- ---------------------------------------------------------------------------
+-- MIGRATION for the existing project_sheet_links table (not itself defined
+-- in this file yet — it predates this script; this only adds one column to
+-- whatever's already live). Run once, by hand, in the SQL Editor. Adds a
+-- per-project "are first_seen_date/repaired_date trustworthy" flag, so a
+-- project with known-bad dates (e.g. a gap in daily uploads that made the
+-- app misattribute when a pipe was really produced/repaired) can be marked
+-- unreliable and excluded from cross-project date-based aggregates
+-- (Newest Produced/Repaired Pipes, the Backlog Trend / Daily Repair Amount
+-- charts) without touching any single-project view — see
+-- pages/home.py:_pipe_sheet_label_map's trusted_only parameter.
+-- ---------------------------------------------------------------------------
+-- alter table project_sheet_links add column if not exists dates_reliable boolean not null default true;
+-- update project_sheet_links set dates_reliable = false where project_sheet = '06-131';
