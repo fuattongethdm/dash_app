@@ -1023,6 +1023,14 @@ def _render_dashboard_inner(selected_unit):
                 # should stop at the last real point instead of drawing a
                 # fake flat continuation across them.
                 backlog_window = backlog_window_real.reindex(date_range)
+                # The table's "Net" column (below) is this same net_all series
+                # reindexed onto the display range, not recomputed from the
+                # trusted-only produced/repaired bars — it has to derive from
+                # the exact same all-confirmed data as backlog_window, or the
+                # two columns can silently disagree on a day where a
+                # dates_reliable=False project (excluded from the bars, not
+                # from the backlog) has an open/close event.
+                net_window = net_all.reindex(date_range, fill_value=0)
 
                 # A continuous date axis infers bar width/spacing from the
                 # gap between neighboring x-values and the overall axis
@@ -1110,14 +1118,15 @@ def _render_dashboard_inner(selected_unit):
                         "produced": produced_daily.values[:real_day_count],
                         "repaired": repaired_daily.values[:real_day_count],
                         "stock": backlog_window.values[:real_day_count],
+                        # Literal day-over-day change in Stock (negative means
+                        # the backlog shrank that day, positive means it
+                        # grew) — from net_window/net_all, not produced minus
+                        # repaired, since those two are trusted-only while
+                        # Stock (and this) count every confirmed project; see
+                        # the comment above net_window's definition.
+                        "net": net_window.values[:real_day_count],
                     }
                 ).iloc[::-1]
-                # Net = Produced - Repaired = literal day-over-day change in
-                # Stock (matches Stock exactly: negative means the backlog
-                # shrank that day, positive means it grew).
-                daily_pipe_table_df["net"] = (
-                    daily_pipe_table_df["produced"] - daily_pipe_table_df["repaired"]
-                )
                 daily_pipe_table = dash_table.DataTable(
                     data=daily_pipe_table_df.to_dict("records"),
                     columns=[

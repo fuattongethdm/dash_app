@@ -74,13 +74,18 @@ def _strip_quarter_prefix(project_no) -> str:
     return re.sub(r"^\d{4}Q-", "", str(project_no))
 
 
-def _pipe_sheet_label_map(links_df: pd.DataFrame) -> dict[str, str]:
+def _pipe_sheet_label_map(links_df: pd.DataFrame, trusted_only: bool = False) -> dict[str, str]:
     """project_sheet -> "project_no (dimensions)" for confirmed mappings —
     duplicate of pages/home.py's _pipe_sheet_label_map, same reasoning as
-    the other constants above."""
+    the other constants above. trusted_only additionally drops sheets
+    flagged dates_reliable=False (see pages/home.py's own docstring for the
+    full rationale) — date-sensitive aggregates like _daily_pipe_count_chart
+    below need this; a plain status count wouldn't."""
     if links_df.empty:
         return {}
     confirmed = links_df[links_df["status"] == "confirmed"]
+    if trusted_only and "dates_reliable" in confirmed.columns:
+        confirmed = confirmed[confirmed["dates_reliable"].fillna(True).astype(bool)]
     labels = confirmed["project_no"].astype(str) + " (" + confirmed["dimensions"].astype(str) + ")"
     return dict(zip(confirmed["project_sheet"], labels))
 
@@ -266,7 +271,7 @@ def _daily_pipe_count_chart(pipe_df: pd.DataFrame, links_df: pd.DataFrame) -> Im
     same as the dashboard's own daily_pipe_fig."""
     if pipe_df.empty:
         return None
-    label_map = _pipe_sheet_label_map(links_df)
+    label_map = _pipe_sheet_label_map(links_df, trusted_only=True)
     mapped_df = pipe_df[pipe_df["project_sheet"].isin(label_map)]
     if mapped_df.empty:
         return None
