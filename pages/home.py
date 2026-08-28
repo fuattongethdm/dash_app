@@ -946,10 +946,21 @@ def _render_dashboard_inner(selected_unit):
     daily_pipe_table = None
     pipe_df_for_daily = load_pipe_repair_details()
     if not pipe_df_for_daily.empty:
-        pipe_label_map = _pipe_sheet_label_map(load_project_sheet_links(), trusted_only=True)
+        links_df_for_daily = load_project_sheet_links()
+        pipe_label_map = _pipe_sheet_label_map(links_df_for_daily, trusted_only=True)
         mapped_pipe_df = pipe_df_for_daily[pipe_df_for_daily["project_sheet"].isin(pipe_label_map)]
+        # The backlog/stock line is a simple current-status count (how many
+        # pipes are Produced-but-not-yet-Repaired right now) — that's true
+        # regardless of whether a project's *dates* are trustworthy, so it
+        # uses every confirmed project, not just trusted_only=True ones.
+        # Only the day-by-day Produced/Repaired bars actually depend on
+        # trusting *when* each pipe's status changed, which is what
+        # dates_reliable=False projects (e.g. 06-131) get excluded from.
+        pipe_label_map_all = _pipe_sheet_label_map(links_df_for_daily)
+        mapped_pipe_df_all = pipe_df_for_daily[pipe_df_for_daily["project_sheet"].isin(pipe_label_map_all)]
         if not mapped_pipe_df.empty:
             repaired_pipe_df = mapped_pipe_df[mapped_pipe_df["status"] == "Repaired"]
+            repaired_pipe_df_all = mapped_pipe_df_all[mapped_pipe_df_all["status"] == "Repaired"]
             latest_activity = mapped_pipe_df[["first_seen_date", "repaired_date"]].max().max()
             daily_pipe_window_start = max(
                 latest_activity - pd.Timedelta(days=DAILY_CHARTS_WINDOW_DAYS - 1),
@@ -999,8 +1010,8 @@ def _render_dashboard_inner(selected_unit):
                 # it's repaired. Forward-fill within the real range so a
                 # day with no events keeps the prior day's level instead of
                 # dropping to 0.
-                opens_all = mapped_pipe_df.groupby(mapped_pipe_df["first_seen_date"].dt.normalize()).size()
-                closes_all = repaired_pipe_df.groupby(repaired_pipe_df["repaired_date"].dt.normalize()).size()
+                opens_all = mapped_pipe_df_all.groupby(mapped_pipe_df_all["first_seen_date"].dt.normalize()).size()
+                closes_all = repaired_pipe_df_all.groupby(repaired_pipe_df_all["repaired_date"].dt.normalize()).size()
                 net_all = opens_all.sub(closes_all, fill_value=0)
                 full_history_range = pd.date_range(net_all.index.min(), latest_activity, freq="D")
                 backlog_series = net_all.reindex(full_history_range, fill_value=0).cumsum()
