@@ -275,17 +275,20 @@ def _daily_pipe_count_chart(pipe_df: pd.DataFrame, links_df: pd.DataFrame) -> Im
     mapped_df = pipe_df[pipe_df["project_sheet"].isin(label_map)]
     if mapped_df.empty:
         return None
+    repaired_df = mapped_df[mapped_df["status"] == "Repaired"]
+    if repaired_df.empty:
+        return None
 
     window_start = max(
-        mapped_df["first_seen_date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS),
+        repaired_df["repaired_date"].max() - pd.Timedelta(days=TREND_WINDOW_DAYS),
         PIPE_TREND_FLOOR_DATE,
     )
     daily_counts = (
-        mapped_df[mapped_df["first_seen_date"] >= window_start]
-        .groupby(mapped_df["first_seen_date"].dt.date)
+        repaired_df[repaired_df["repaired_date"] >= window_start]
+        .groupby(repaired_df["repaired_date"].dt.date)
         .size()
         .reset_index(name="count")
-        .rename(columns={"first_seen_date": "date"})
+        .rename(columns={"repaired_date": "date"})
     )
     daily_counts["date"] = pd.to_datetime(daily_counts["date"])
 
