@@ -156,6 +156,14 @@ INSERT INTO pipe_repair_details (
     :surface_state, :status, :repaired_date
 )
 ON CONFLICT(project_sheet, block_cell) DO UPDATE SET
+    -- Every field here (including first_seen_date/status/repaired_date,
+    -- previously handled by CASE expressions duplicating Python logic) is
+    -- just written as-is: upsert_pipe_repair_details already reconciled
+    -- each one against the existing row in Python before calling this, the
+    -- same way it does for the Supabase backend -- see that function and
+    -- _existing_pipe_state for the actual "set once" / order-independent
+    -- reconciliation rules.
+    first_seen_date = excluded.first_seen_date,
     last_updated_date = excluded.last_updated_date,
     pipe_no = excluded.pipe_no,
     pipe_length_ft = excluded.pipe_length_ft,
@@ -164,25 +172,8 @@ ON CONFLICT(project_sheet, block_cell) DO UPDATE SET
     repair_count = excluded.repair_count,
     repair_category = excluded.repair_category,
     surface_state = excluded.surface_state,
-    -- If a pipe was Repaired before AND this upload's own parse still
-    -- shows repair data too, keep repaired_date frozen at when that first
-    -- happened (same "set once" behavior first_seen_date already has, not
-    -- in this SET list at all so SQLite leaves it untouched natively) --
-    -- don't reset it just because the upload re-confirms the same repair.
-    -- Otherwise (including a pipe that WAS Repaired but this upload's own
-    -- block now shows no repair data) trust this upload's own status/
-    -- repaired_date as parsed -- a correction in the source Excel is real,
-    -- current data and must not be permanently overridden by an earlier
-    -- upload's now-stale "Repaired" state.
-    status = CASE
-        WHEN pipe_repair_details.status = 'Repaired' AND excluded.status = 'Repaired' THEN 'Repaired'
-        ELSE excluded.status
-    END,
-    repaired_date = CASE
-        WHEN pipe_repair_details.status = 'Repaired' AND excluded.status = 'Repaired'
-            THEN pipe_repair_details.repaired_date
-        ELSE excluded.repaired_date
-    END;
+    status = excluded.status,
+    repaired_date = excluded.repaired_date;
 """
 
 PROJECT_GROUP_CONFIG_UPSERT_SQL = """
@@ -603,8 +594,11 @@ def _pipe_records_from_df(df: pd.DataFrame) -> list[dict[str, Any]]:
     carries a single ``date`` — the day of this upload). Both
     ``first_seen_date`` and ``last_updated_date`` default to that date here;
     for a pipe that already exists, the caller (upsert_pipe_repair_details)
-    overrides ``first_seen_date`` with its real, original value before
-    writing, so a pipe's repair date never changes on re-upload.
+    reconciles ``first_seen_date`` down to the earliest of this upload's own
+    value and whatever's already on file — so a pipe's first-seen date
+    converges to the truth even if daily files get uploaded out of order —
+    and, for the other fields, defers to whichever of the two upload dates
+    is more recent so an older backfill can't regress newer data.
 
     ``status`` (``"Produced"``/``"Repaired"``) already comes from the
     parser, computed purely from whether *this* block has repair data —
@@ -698,36 +692,75 @@ def load_master_data(conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     return df
 
 
-def _existing_pipe_state() -> dict[tuple[str, str], dict[str, Any]]:
-    """(project_sheet, block_cell) -> {first_seen_date, status, repaired_date}
-    for every pipe already on file — the whole table, no date filter, since
-    the table is now bounded to one row per physical pipe rather than one
-    per pipe per day. Supabase-only: PostgREST's upsert can't "update every
-    column except some," so the caller uses this to preserve a pipe's
-    original first_seen_date, and its status/repaired_date once it's been
-    marked Repaired, in Python before re-upserting it. SQLite's
-    ON CONFLICT ... DO UPDATE already handles all three natively (see
-    PIPE_UPSERT_SQL), so it doesn't need this lookup."""
-    client = _get_supabase_client()
-    rows: list[dict[str, Any]] = []
-    page_size = 1000
-    try:
-        for start in range(0, 100_000, page_size):
-            response = _execute_with_retry(
-                client.table(PIPE_TABLE_NAME)
-                .select("project_sheet,block_cell,first_seen_date,status,repaired_date")
-                .order("project_sheet")
-                .order("block_cell")
-                .range(start, start + page_size - 1)
-            )
-            rows.extend(response.data)
-            if len(response.data) < page_size:
-                break
-    except Exception as exc:
-        if PIPE_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
-            return {}
-        raise
-    return {(row["project_sheet"], row["block_cell"]): row for row in rows}
+# Every column upsert_pipe_repair_details might need to restore from the
+# existing row (see _PIPE_RECONCILE_FROZEN_FIELDS below) — kept as one list
+# so the Supabase .select() and the SQLite SELECT can't drift apart on which
+# columns they fetch.
+_PIPE_STATE_COLUMNS = (
+    "project_sheet",
+    "block_cell",
+    "first_seen_date",
+    "last_updated_date",
+    "status",
+    "repaired_date",
+    "pipe_no",
+    "pipe_length_ft",
+    "repair_amount",
+    "repair_ratio",
+    "repair_count",
+    "repair_category",
+    "surface_state",
+)
+
+
+def _existing_pipe_state(conn: sqlite3.Connection | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    """(project_sheet, block_cell) -> a dict of _PIPE_STATE_COLUMNS for
+    every pipe already on file — the whole table, no date filter, since the
+    table is bounded to one row per physical pipe rather than one per pipe
+    per day. The caller (upsert_pipe_repair_details) uses this to reconcile
+    an incoming upload against whatever's already on file *in Python*, for
+    both backends — PostgREST's upsert can't "update every column except
+    some," and doing the same order-independent reconciliation twice (once
+    here, once as SQL CASE expressions for SQLite) would only invite the
+    two to drift apart."""
+    if get_backend_name() == "supabase":
+        client = _get_supabase_client()
+        rows: list[dict[str, Any]] = []
+        page_size = 1000
+        try:
+            for start in range(0, 100_000, page_size):
+                response = _execute_with_retry(
+                    client.table(PIPE_TABLE_NAME)
+                    .select(",".join(_PIPE_STATE_COLUMNS))
+                    .order("project_sheet")
+                    .order("block_cell")
+                    .range(start, start + page_size - 1)
+                )
+                rows.extend(response.data)
+                if len(response.data) < page_size:
+                    break
+        except Exception as exc:
+            if PIPE_TABLE_NAME in str(exc) and ("PGRST205" in str(exc) or "schema cache" in str(exc)):
+                return {}
+            raise
+        return {(row["project_sheet"], row["block_cell"]): row for row in rows}
+
+    should_close = conn is None
+    conn = conn or get_connection()
+    init_db(conn)
+    rows = conn.execute(
+        f"SELECT {', '.join(_PIPE_STATE_COLUMNS)} FROM pipe_repair_details"
+    ).fetchall()
+    if should_close:
+        conn.close()
+    return {(row["project_sheet"], row["block_cell"]): dict(row) for row in rows}
+
+
+# Every _PIPE_STATE_COLUMNS field except the two identity columns and
+# first_seen_date (which gets its own min()-based handling, not a freeze).
+_PIPE_RECONCILE_FROZEN_FIELDS = tuple(
+    col for col in _PIPE_STATE_COLUMNS if col not in ("project_sheet", "block_cell", "first_seen_date")
+)
 
 
 def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None = None) -> int:
@@ -735,28 +768,63 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
         return 0
     records = _pipe_records_from_df(df)
 
+    should_close = conn is None and get_backend_name() != "supabase"
+    if get_backend_name() != "supabase":
+        conn = conn or get_connection()
+        init_db(conn)
+    existing_state = _existing_pipe_state(conn)
+
+    for record in records:
+        key = (record["project_sheet"], record["block_cell"])
+        existing = existing_state.get(key)
+        if existing is None:
+            continue  # brand new pipe — keep this upload's own values as-is
+
+        incoming_date = record["last_updated_date"]  # this upload's own report date
+        existing_first_seen = existing["first_seen_date"]
+        existing_last_updated = existing.get("last_updated_date") or existing_first_seen
+        existing_repaired_date = existing.get("repaired_date")
+        incoming_repaired_date = record.get("repaired_date")
+        both_repaired = existing.get("status") == "Repaired" and record["status"] == "Repaired"
+
+        # first_seen_date always converges to the earliest known production
+        # date, regardless of which order uploads for different days arrive
+        # in (dates compare correctly as "YYYY-MM-DD" strings).
+        record["first_seen_date"] = min(incoming_date, existing_first_seen)
+
+        if incoming_date < existing_last_updated:
+            # This upload's own report date is OLDER than data already on
+            # file (an out-of-order/backfill upload, e.g. today's file
+            # uploaded before yesterday's) — the existing row already
+            # reflects a later date's status, so don't let older data
+            # regress it. Only first_seen_date (above), and repaired_date
+            # below when both sides agree Repaired, may still move earlier.
+            for field in _PIPE_RECONCILE_FROZEN_FIELDS:
+                if field in existing:
+                    record[field] = existing[field]
+
+        if both_repaired:
+            # Already repaired as of the existing row, and this upload's
+            # own parse shows repair data too — repaired_date converges to
+            # whichever of the two is earlier (the true first time it was
+            # repaired), the same "earliest known date wins" rule as
+            # first_seen_date, regardless of which upload arrived first.
+            if existing_repaired_date and incoming_repaired_date:
+                record["repaired_date"] = min(existing_repaired_date, incoming_repaired_date)
+            else:
+                record["repaired_date"] = existing_repaired_date or incoming_repaired_date
+        # else: repaired_date is already correctly resolved above — either
+        # this upload's own freshly-parsed value stands (normal in-order
+        # path: a Produced -> Repaired transition, or a genuine correction
+        # back to Produced in the source Excel, which must not be
+        # permanently overridden by an earlier upload's now-stale
+        # "Repaired" state), or, for an out-of-order upload showing
+        # Produced while the existing row is already Repaired, the frozen
+        # existing value from the loop above (an older snapshot's "not
+        # repaired yet" must not regress a newer, real repair).
+
     if get_backend_name() == "supabase":
         client = _get_supabase_client()
-        existing_state = _existing_pipe_state()
-        for record in records:
-            key = (record["project_sheet"], record["block_cell"])
-            existing = existing_state.get(key)
-            if existing is None:
-                continue  # brand new pipe — keep this upload's own status/repaired_date/first_seen_date as-is
-            record["first_seen_date"] = existing["first_seen_date"]
-            if existing.get("status") == "Repaired" and record["status"] == "Repaired":
-                # Already repaired as of some earlier upload, and this
-                # upload's own parse still shows repair data too — don't
-                # reset repaired_date to today just because this upload
-                # re-confirms the same repair.
-                record["repaired_date"] = existing.get("repaired_date")
-            # else: let this upload's own computed status/repaired_date
-            # stand as parsed. Covers a pipe transitioning Produced ->
-            # Repaired today, AND a pipe that was marked Repaired before
-            # but this upload's own block now shows no repair data — a
-            # correction in the source Excel is real, current data and
-            # must not be permanently overridden by an earlier upload's
-            # now-stale "Repaired" state.
         for start in range(0, len(records), 500):
             batch = records[start : start + 500]
             _execute_with_retry(
@@ -768,9 +836,6 @@ def upsert_pipe_repair_details(df: pd.DataFrame, conn: sqlite3.Connection | None
         _cache_invalidate(PIPE_TABLE_NAME)
         return len(records)
 
-    should_close = conn is None
-    conn = conn or get_connection()
-    init_db(conn)
     conn.executemany(PIPE_UPSERT_SQL, records)
     conn.commit()
     if should_close:
